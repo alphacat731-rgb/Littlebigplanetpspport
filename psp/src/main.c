@@ -1,93 +1,98 @@
 #include <pspkernel.h>
 #include <pspdebug.h>
 #include <pspctrl.h>
-
+#include <pspiofilemgr.h>
+#include <pspdisplay.h>
+#include <pspgu.h>
+#include <pspge.h>
+#include <pspaudio.h>
+#include <psputility.h>
+#include <psputility_avmodules.h>
+#include <pspmpeg.h>
+#include <malloc.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 PSP_MODULE_INFO("LBPPSP Alpha", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_MAIN_THREAD_STACK_SIZE_KB(64);
 
-typedef enum {
-    SCREEN_MENU = 0,
-    SCREEN_PROTOTYPE,
-    SCREEN_MEDIA,
-    SCREEN_CREDITS
-} Screen;
+#define W 480
+#define H 272
+#define FBW 512
+#define PACKETS 512
+#define SECTOR 2048
+#define PCM_SAMPLES 512
+#define PCM_BYTES (PCM_SAMPLES * 2 * sizeof(short))
+#define PMF_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF"
+#define PCM_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM"
+#define DRAW_BYTES (FBW * H * 4)
+#define DISP_BYTES (FBW * H * 4)
 
-static const char *menu_items[] = {
-    "Start Prototype",
-    "Intro Video",
-    "Credits",
-    "Exit"
-};
+typedef struct {
+    SceUID file;
+    unsigned int total;
+    unsigned int read_bytes;
+    int eof;
+} PmfInput;
 
-static const int menu_item_count = (int)(sizeof(menu_items) / sizeof(menu_items[0]));
-static int selected_item = 0;
-static Screen current_screen = SCREEN_MENU;
+typedef struct {
+    SceUID file;
+    SceUID thread;
+    int channel;
+    volatile int running;
+    volatile int paused;
+    volatile int done;
+    volatile unsigned int samples_played;
+    void *buffer;
+} PcmOutput;
 
-static int exit_callback(int arg1, int arg2, void *common)
+typedef struct {
+    short u, v, x, y, z;
+} VideoVertex;
+
+static unsigned int __attribute__((aligned(16))) gu_list[8192];
+
+static int exit_callback(int a, int b, void *c)
 {
-    (void)arg1;
-    (void)arg2;
-    (void)common;
+    (void)a; (void)b; (void)c;
     sceKernelExitGame();
     return 0;
 }
 
 static int callback_thread(SceSize args, void *argp)
 {
-    (void)args;
-    (void)argp;
-
-    SceUID callback_id = sceKernelCreateCallback("LBPPSP Exit", exit_callback, NULL);
-    if (callback_id >= 0) {
-        sceKernelRegisterExitCallback(callback_id);
-    }
-
+    SceUID cb;
+    (void)args; (void)argp;
+    cb = sceKernelCreateCallback("LBPPSP Exit", exit_callback, NULL);
+    if (cb >= 0) sceKernelRegisterExitCallback(cb);
     sceKernelSleepThreadCB();
     return 0;
 }
 
 static void setup_callbacks(void)
 {
-    SceUID thread_id = sceKernelCreateThread(
-        "LBPPSP Callback Thread",
-        callback_thread,
-        0x11,
-        0xFA0,
-        0,
-        NULL
-    );
-
-    if (thread_id >= 0) {
-        sceKernelStartThread(thread_id, 0, NULL);
-    }
+    SceUID th = sceKernelCreateThread("LBPPSP Callback", callback_thread,
+                                      0x11, 0xFA0, 0, NULL);
+    if (th >= 0) sceKernelStartThread(th, 0, NULL);
 }
 
-static void draw_menu(void)
+static void draw_menu(int selected)
 {
     int i;
-
+    const char *items[] = { "Start Prototype", "Play Intro Video", "Credits", "Exit" };
     pspDebugScreenClear();
-    pspDebugScreenSetTextColor(0xFFFFFFFF);
     pspDebugScreenSetXY(3, 2);
+    pspDebugScreenSetTextColor(0xFFFFFFFF);
     pspDebugScreenPrintf("LITTLEBIGPLANET PSP: ALPHA\n");
     pspDebugScreenPrintf("----------------------------------------------\n\n");
-
     pspDebugScreenSetTextColor(0xFF9BE24A);
     pspDebugScreenPrintf("  A small world is loading...\n\n");
-
-    for (i = 0; i < menu_item_count; ++i) {
-        if (i == selected_item) {
-            pspDebugScreenSetTextColor(0xFF9BE24A);
-            pspDebugScreenPrintf("  > %s\n", menu_items[i]);
-        } else {
-            pspDebugScreenSetTextColor(0xFFE8E8E8);
-            pspDebugScreenPrintf("    %s\n", menu_items[i]);
-        }
+    for (i = 0; i < 4; ++i) {
+        pspDebugScreenSetTextColor(i == selected ? 0xFF9BE24A : 0xFFE8E8E8);
+        pspDebugScreenPrintf(i == selected ? "  > %s\n" : "    %s\n", items[i]);
     }
-
     pspDebugScreenSetTextColor(0xFFB0B0B0);
     pspDebugScreenPrintf("\n\n  D-Pad: Select    X: Confirm    O: Back\n");
     pspDebugScreenPrintf("  HOME: Exit to the PSP menu\n");
@@ -100,99 +105,362 @@ static void draw_page(const char *title, const char *body)
     pspDebugScreenSetTextColor(0xFF9BE24A);
     pspDebugScreenPrintf("LITTLEBIGPLANET PSP: ALPHA\n");
     pspDebugScreenPrintf("----------------------------------------------\n\n");
-
     pspDebugScreenSetTextColor(0xFFFFFFFF);
     pspDebugScreenPrintf("%s\n\n", title);
     pspDebugScreenSetTextColor(0xFFE0E0E0);
     pspDebugScreenPrintf("%s\n", body);
-
     pspDebugScreenSetTextColor(0xFFB0B0B0);
     pspDebugScreenPrintf("\n\n  Press O to return to the menu.\n");
 }
 
-static void open_selected_item(void)
+/* The Media Engine ringbuffer consumes complete 2048-byte MPEG sectors. */
+static SceInt32 pmf_read_callback(ScePVoid data, SceInt32 packets, ScePVoid param)
 {
-    switch (selected_item) {
-    case 0:
-        current_screen = SCREEN_PROTOTYPE;
-        draw_page(
-            "PROTOTYPE BOOTED",
-            "The PSP executable and controller input are running.\n\n"
-            "This repository currently contains presentation assets, not\n"
-            "the original game's source or gameplay systems.\n\n"
-            "This first build is the bootable foundation."
-        );
-        break;
+    PmfInput *in = (PmfInput *)param;
+    unsigned int wanted = (unsigned int)packets * SECTOR;
+    unsigned int got = 0;
+    if (in->read_bytes >= in->total) {
+        in->eof = 1;
+        return 0;
+    }
+    if (wanted > in->total - in->read_bytes)
+        wanted = in->total - in->read_bytes;
+    wanted -= wanted % SECTOR;
+    while (got < wanted) {
+        int n = sceIoRead(in->file, (unsigned char *)data + got, wanted - got);
+        if (n <= 0) {
+            in->eof = 1;
+            break;
+        }
+        got += (unsigned int)n;
+    }
+    in->read_bytes += got;
+    if (got != wanted || (got % SECTOR) != 0) {
+        in->eof = 1;
+        return -1;
+    }
+    return (SceInt32)(got / SECTOR);
+}
 
-    case 1:
-        current_screen = SCREEN_MEDIA;
-        draw_page(
-            "INTRO VIDEO",
-            "The build workflow creates a PSP-compatible MP4 at:\n\n"
-            "  ms0:/VIDEO/LBPPSP_ALPHA_INTRO.MP4\n\n"
-            "Open it from the PSP XMB Video menu. Automatic playback\n"
-            "inside this homebrew is not implemented in this first build."
-        );
-        break;
+static int pcm_thread(SceSize args, void *argp)
+{
+    PcmOutput *out = (PcmOutput *)argp;
+    (void)args;
+    while (out->running) {
+        int n;
+        if (out->paused) {
+            sceKernelDelayThread(1000);
+            continue;
+        }
+        n = sceIoRead(out->file, out->buffer, PCM_BYTES);
+        if (n <= 0) {
+            out->done = 1;
+            break;
+        }
+        if (n < PCM_BYTES)
+            memset((unsigned char *)out->buffer + n, 0, PCM_BYTES - n);
+        sceAudioOutputBlocking(out->channel, PSP_AUDIO_VOLUME_MAX, out->buffer);
+        out->samples_played += (unsigned int)(n / 4);
+        if (n < PCM_BYTES) {
+            out->done = 1;
+            break;
+        }
+    }
+    return 0;
+}
 
-    case 2:
-        current_screen = SCREEN_CREDITS;
-        draw_page(
-            "CREDITS",
-            "LittleBigPlanet PSP: Alpha\n"
-            "Homebrew build foundation\n\n"
-            "Artwork and source media are kept in the repository."
-        );
-        break;
+static int pcm_start(PcmOutput *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->file = sceIoOpen(PCM_PATH, PSP_O_RDONLY, 0);
+    out->thread = -1;
+    out->channel = -1;
+    if (out->file < 0) return -1;
+    out->channel = sceAudioChReserve(-1, PCM_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
+    if (out->channel < 0) return -2;
+    out->buffer = memalign(64, PCM_BYTES);
+    if (!out->buffer) return -3;
+    out->running = 1;
+    out->thread = sceKernelCreateThread("LBPPSP PCM", pcm_thread, 0x18,
+                                        0x4000, PSP_THREAD_ATTR_USER, NULL);
+    if (out->thread < 0) return -4;
+    if (sceKernelStartThread(out->thread, sizeof(*out), out) < 0) return -5;
+    return 0;
+}
 
-    default:
+static void pcm_stop(PcmOutput *out)
+{
+    out->running = 0;
+    if (out->thread >= 0) {
+        sceKernelTerminateDeleteThread(out->thread);
+        out->thread = -1;
+    }
+    if (out->channel >= 0) {
+        sceAudioChRelease(out->channel);
+        out->channel = -1;
+    }
+    if (out->file >= 0) {
+        sceIoClose(out->file);
+        out->file = -1;
+    }
+    if (out->buffer) {
+        free(out->buffer);
+        out->buffer = NULL;
+    }
+}
+
+static void gu_video_init(void)
+{
+    sceGuInit();
+    sceGuStart(GU_DIRECT, gu_list);
+    sceGuDrawBuffer(GU_PSM_8888, (void *)0, FBW);
+    sceGuDispBuffer(W, H, (void *)DISP_BYTES, FBW);
+    sceGuOffset(2048 - W / 2, 2048 - H / 2);
+    sceGuViewport(2048, 2048, W, H);
+    sceGuScissor(0, 0, W, H);
+    sceGuEnable(GU_SCISSOR_TEST);
+    sceGuDisable(GU_DEPTH_TEST);
+    sceGuDisable(GU_BLEND);
+    sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
+    sceGuTexFilter(GU_LINEAR, GU_LINEAR);
+    sceGuEnable(GU_TEXTURE_2D);
+    sceGuClearColor(0xFF000000);
+    sceGuClear(GU_COLOR_BUFFER_BIT);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
+    sceGuDisplay(GU_TRUE);
+}
+
+static void gu_video_frame(void *frame)
+{
+    VideoVertex *v;
+    sceGuStart(GU_DIRECT, gu_list);
+    sceGuClearColor(0xFF000000);
+    sceGuClear(GU_COLOR_BUFFER_BIT);
+    sceGuTexImage(0, 512, 512, FBW, frame);
+    v = (VideoVertex *)sceGuGetMemory(2 * sizeof(VideoVertex));
+    v[0].u = 0; v[0].v = 0; v[0].x = 0; v[0].y = 0; v[0].z = 0;
+    v[1].u = W; v[1].v = H; v[1].x = W; v[1].y = H; v[1].z = 0;
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT |
+                   GU_TRANSFORM_2D, 2, NULL, v);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
+}
+
+static int wait_audio(PcmOutput *audio, unsigned int pts)
+{
+    unsigned int target;
+    if (pts == 0xFFFFFFFFu || pts <= 90000u) return 0;
+    target = (unsigned int)(((unsigned long long)(pts - 90000u) * 44100u) / 90000u);
+    while (audio->running && !audio->done && audio->samples_played < target) {
+        SceCtrlData pad;
+        sceCtrlPeekBufferPositive(&pad, 1);
+        if (pad.Buttons & PSP_CTRL_CIRCLE) return -1;
+        sceKernelDelayThread(1000);
+    }
+    return 0;
+}
+
+static int play_intro(void)
+{
+    int result = -1, avcodec = 0, mpegbase = 0, mpeginit = 0;
+    int rb_ready = 0, mpeg_ready = 0, stream_ready = 0, es_ready = 0, gu_ready = 0;
+    SceUID file = -1;
+    unsigned char header[0x800];
+    SceMpeg mpeg = NULL;
+    SceMpegRingbuffer ring;
+    SceMpegStream *stream = NULL;
+    SceMpegAu au;
+    SceMpegAvcMode mode;
+    PmfInput input;
+    PcmOutput audio;
+    void *rb_mem = NULL, *mpeg_mem = NULL, *es = NULL, *frame = NULL;
+    int rb_size, mpeg_size, offset = 0, stream_size = 0, unknown = 0, decode_status = 0;
+    unsigned int previous = 0;
+    int audio_started = 0, frames = 0;
+
+    memset(&input, 0, sizeof(input));
+    memset(&audio, 0, sizeof(audio));
+    input.file = -1;
+    audio.file = -1;
+    audio.thread = -1;
+    audio.channel = -1;
+
+    draw_page("LOADING INTRO", "Opening the in-game PMF video and soundtrack...");
+    file = sceIoOpen(PMF_PATH, PSP_O_RDONLY, 0);
+    if (file < 0) goto cleanup;
+    if (sceIoRead(file, header, sizeof(header)) != (int)sizeof(header)) goto cleanup;
+    if (memcmp(header, "PSMF0014", 8) != 0) goto cleanup;
+
+    if (sceUtilityLoadAvModule(PSP_AV_MODULE_AVCODEC) < 0) goto cleanup;
+    avcodec = 1;
+    if (sceUtilityLoadAvModule(PSP_AV_MODULE_MPEGBASE) < 0) goto cleanup;
+    mpegbase = 1;
+    if (sceMpegInit() < 0) goto cleanup;
+    mpeginit = 1;
+
+    rb_size = sceMpegRingbufferQueryMemSize(PACKETS);
+    mpeg_size = sceMpegQueryMemSize(0);
+    if (rb_size <= 0 || mpeg_size <= 0) goto cleanup;
+    rb_mem = memalign(64, rb_size);
+    mpeg_mem = memalign(64, mpeg_size);
+    if (!rb_mem || !mpeg_mem) goto cleanup;
+
+    input.file = file;
+    if (sceMpegRingbufferConstruct(&ring, PACKETS, rb_mem, rb_size,
+                                   pmf_read_callback, &input) < 0) goto cleanup;
+    rb_ready = 1;
+    if (sceMpegCreate(&mpeg, mpeg_mem, mpeg_size, &ring, FBW, 0, 0) < 0) goto cleanup;
+    mpeg_ready = 1;
+
+    mode.iUnk0 = -1;
+    mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
+    sceMpegAvcDecodeMode(&mpeg, &mode);
+    if (sceMpegQueryStreamOffset(&mpeg, header, &offset) < 0) goto cleanup;
+    if (sceMpegQueryStreamSize(header, &stream_size) < 0) goto cleanup;
+    if (offset < (int)sizeof(header) || stream_size <= 0 ||
+        (stream_size % SECTOR) != 0) goto cleanup;
+    if (offset > (int)sizeof(header)) {
+        int skip = offset - (int)sizeof(header);
+        unsigned char scratch[512];
+        while (skip > 0) {
+            int n = sceIoRead(file, scratch, skip > (int)sizeof(scratch) ? (int)sizeof(scratch) : skip);
+            if (n <= 0) goto cleanup;
+            skip -= n;
+        }
+    }
+    input.total = (unsigned int)stream_size;
+    stream = sceMpegRegistStream(&mpeg, 0, 0);
+    if (!stream) goto cleanup;
+    stream_ready = 1;
+    es = sceMpegMallocAvcEsBuf(&mpeg);
+    if (!es || sceMpegInitAu(&mpeg, es, &au) < 0) goto cleanup;
+    es_ready = 1;
+
+    frame = (unsigned char *)sceGeEdramGetAddr() + DRAW_BYTES + DISP_BYTES;
+    gu_video_init();
+    gu_ready = 1;
+
+    for (;;) {
+        SceCtrlData pad;
+        unsigned int pressed;
+        int available, got;
+
+        sceCtrlReadBufferPositive(&pad, 1);
+        pressed = pad.Buttons & ~previous;
+        previous = pad.Buttons;
+        if (pressed & PSP_CTRL_CIRCLE) { result = 1; break; }
+        if (pressed & PSP_CTRL_CROSS) audio.paused = !audio.paused;
+        if (audio.paused) { sceKernelDelayThread(1000); continue; }
+
+        available = sceMpegRingbufferAvailableSize(&ring);
+        if (available > 0) {
+            int count = available > 32 ? 32 : available;
+            sceMpegRingbufferPut(&ring, count, available);
+        }
+        got = sceMpegGetAvcAu(&mpeg, stream, &au, &unknown);
+        if (got == 0) {
+            int decoded = sceMpegAvcDecode(&mpeg, &au, FBW, &frame, &decode_status);
+            if (decoded < 0) goto cleanup;
+            if (decode_status == 1) {
+                if (!audio_started) {
+                    if (pcm_start(&audio) != 0) goto cleanup;
+                    audio_started = 1;
+                }
+                if (wait_audio(&audio, au.iPts) < 0) { result = 1; break; }
+                gu_video_frame(frame);
+                ++frames;
+            }
+        } else {
+            if (input.eof && sceMpegRingbufferAvailableSize(&ring) >= PACKETS)
+                break;
+            sceKernelDelayThread(1000);
+        }
+    }
+    if (frames > 0 && result == -1) result = 0;
+
+cleanup:
+    pcm_stop(&audio);
+    if (gu_ready) {
+        sceGuTerm();
+        pspDebugScreenInit();
+    }
+    if (es_ready) sceMpegFreeAvcEsBuf(&mpeg, es);
+    if (stream_ready) sceMpegUnRegistStream(mpeg, stream);
+    if (mpeg_ready) sceMpegDelete(&mpeg);
+    if (rb_ready) sceMpegRingbufferDestruct(&ring);
+    if (mpeginit) sceMpegFinish();
+    if (mpegbase) sceUtilityUnloadAvModule(PSP_AV_MODULE_MPEGBASE);
+    if (avcodec) sceUtilityUnloadAvModule(PSP_AV_MODULE_AVCODEC);
+    if (rb_mem) free(rb_mem);
+    if (mpeg_mem) free(mpeg_mem);
+    if (file >= 0) sceIoClose(file);
+    return result;
+}
+
+static void open_selected(int selected)
+{
+    if (selected == 0) {
+        draw_page("PROTOTYPE BOOTED",
+                  "The PSP executable and controller input are running.\n\n"
+                  "This is the bootable foundation for the project.");
+    } else if (selected == 1) {
+        int status = play_intro();
+        if (status == 0)
+            draw_page("INTRO FINISHED", "The in-game cutscene reached the end.");
+        else if (status == 1)
+            draw_page("INTRO STOPPED", "Playback was stopped. Press O to return.");
+        else
+            draw_page("VIDEO PLAYER ERROR",
+                      "Could not open or decode the intro. Check that INTRO.PMF and "
+                      "INTRO.PCM are beside EBOOT.PBP in the game folder.");
+    } else if (selected == 2) {
+        draw_page("CREDITS", "LittleBigPlanet PSP: Alpha\nHomebrew boot and video player prototype.");
+    } else {
         sceKernelExitGame();
-        break;
     }
 }
 
 int main(void)
 {
     SceCtrlData pad;
-    unsigned int previous_buttons = 0;
-
+    unsigned int previous = 0;
+    int selected = 0;
     setup_callbacks();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
-
     pspDebugScreenInit();
-    draw_menu();
+    draw_menu(selected);
 
     for (;;) {
         unsigned int pressed;
-
         sceCtrlReadBufferPositive(&pad, 1);
-        pressed = pad.Buttons & ~previous_buttons;
-        previous_buttons = pad.Buttons;
-
-        if (current_screen == SCREEN_MENU) {
-            int changed = 0;
-
-            if ((pressed & PSP_CTRL_UP) && selected_item > 0) {
-                --selected_item;
-                changed = 1;
-            } else if ((pressed & PSP_CTRL_DOWN) && selected_item < menu_item_count - 1) {
-                ++selected_item;
-                changed = 1;
-            } else if (pressed & PSP_CTRL_CROSS) {
-                open_selected_item();
+        pressed = pad.Buttons & ~previous;
+        previous = pad.Buttons;
+        if (pad.Buttons & PSP_CTRL_HOME) sceKernelExitGame();
+        if (pressed & PSP_CTRL_UP) {
+            if (selected > 0) --selected;
+            draw_menu(selected);
+        } else if (pressed & PSP_CTRL_DOWN) {
+            if (selected < 3) ++selected;
+            draw_menu(selected);
+        } else if (pressed & PSP_CTRL_CROSS) {
+            open_selected(selected);
+            if (selected != 3) {
+                while (1) {
+                    sceCtrlReadBufferPositive(&pad, 1);
+                    if (pad.Buttons & PSP_CTRL_CIRCLE) break;
+                    sceKernelDelayThread(1000 * 1000 / 60);
+                }
+                draw_menu(selected);
             }
-
-            if (changed) {
-                draw_menu();
-            }
-        } else if (pressed & PSP_CTRL_CIRCLE) {
-            current_screen = SCREEN_MENU;
-            draw_menu();
         }
-
         sceKernelDelayThread(1000 * 1000 / 60);
     }
-
     return 0;
 }

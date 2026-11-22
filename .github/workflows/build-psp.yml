@@ -12,9 +12,9 @@ permissions:
 
 jobs:
   build:
-    name: Convert media and build PSP EBOOT
+    name: Convert in-game cutscene and build PSP EBOOT
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     steps:
       - name: Check out source
@@ -33,11 +33,12 @@ jobs:
       - name: Validate source assets
         run: python scripts/validate_assets.py --ffprobe ffprobe
 
-      - name: Convert intro to PSP-compatible MP4
+      - name: Build in-game PMF video and synchronized PCM audio
         run: |
-          python scripts/convert_intro.py \
+          python scripts/build_intro_pmf.py \
             --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
-            --output "build/LBPPSP_ALPHA_INTRO.MP4"
+            --output "build/LBPPSP_ALPHA_INTRO.PMF" \
+            --audio-output "build/LBPPSP_ALPHA_INTRO.PCM"
 
       - name: Clean PSP build
         run: |
@@ -60,21 +61,25 @@ jobs:
       - name: Assemble Memory Stick layout
         run: |
           mkdir -p dist/PSP/GAME/LBPPSP_ALPHA
-          mkdir -p dist/VIDEO
           cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
-          cp build/LBPPSP_ALPHA_INTRO.MP4 dist/VIDEO/LBPPSP_ALPHA_INTRO.MP4
-          cat > dist/README.txt <<'EOF'
+          cp build/LBPPSP_ALPHA_INTRO.PMF dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF
+          cp build/LBPPSP_ALPHA_INTRO.PCM dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
+          cat > dist/README.txt <<'EOF2'
           LBPPSP Alpha - PSP homebrew build
 
           Copy the PSP folder to the root of the Memory Stick.
-          The application will appear under Game > Memory Stick.
+          Start the application under Game > Memory Stick.
 
-          Copy the VIDEO folder to the root of the Memory Stick.
-          The converted intro can be opened from the PSP XMB Video menu.
+          Select "Play Intro Video" to play the 480x272 cutscene inside the app.
+          X pauses/resumes the cutscene. O returns to the app menu.
 
-          Note: this initial EBOOT is a bootable menu/prototype shell.
-          It does not yet decode or play the intro from inside the application.
-          EOF
+          Keep INTRO.PMF and INTRO.PCM in the same folder as EBOOT.PBP.
+          INTRO.PMF contains the H.264 video; INTRO.PCM is its synchronized
+          44.1 kHz stereo soundtrack used by the in-game audio thread.
+
+          This is still a bootable prototype shell, not the complete original
+          LittleBigPlanet game or its original gameplay systems.
+          EOF2
           zip -qr LBPPSP_ALPHA_build.zip dist
 
       - name: Upload PSP build
@@ -83,7 +88,8 @@ jobs:
           name: LBPPSP-Alpha-PSP-build
           path: |
             psp/EBOOT.PBP
-            build/LBPPSP_ALPHA_INTRO.MP4
+            build/LBPPSP_ALPHA_INTRO.PMF
+            build/LBPPSP_ALPHA_INTRO.PCM
             LBPPSP_ALPHA_build.zip
           if-no-files-found: error
           retention-days: 14
