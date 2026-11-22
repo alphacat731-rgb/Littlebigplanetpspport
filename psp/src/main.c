@@ -329,7 +329,7 @@ static int wait_audio(PcmOutput *audio, unsigned int pts)
 static int play_intro(void)
 {
     int result = -1, avcodec = 0, mpegbase = 0, mpeginit = 0;
-    int rb_ready = 0, mpeg_ready = 0, stream_ready = 0, es_ready = 0, gu_ready = 0;
+    int rb_ready = 0, mpeg_ready = 0, stream_ready = 0, gu_ready = 0;
     SceUID file = -1;
     unsigned char header[0x800];
     SceMpeg mpeg = NULL;
@@ -429,7 +429,8 @@ static int play_intro(void)
         available = sceMpegRingbufferAvailableSize(&ring);
         if (available > 0) {
             int count = available > 32 ? 32 : available;
-            sceMpegRingbufferPut(&ring, count, available);
+            if (sceMpegRingbufferPut(&ring, count, available) < 0)
+                goto cleanup;
         }
         got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
         if (got == 0) {
