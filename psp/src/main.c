@@ -234,6 +234,7 @@ static void gu_video_init(void)
     sceGuDisplay(GU_TRUE);
 }
 
+
 static void gu_video_frame(void *frame)
 {
     VideoVertex *v;
@@ -250,6 +251,61 @@ static void gu_video_frame(void *frame)
     sceGuSync(0, 0);
     sceDisplayWaitVblankStart();
     sceGuSwapBuffers();
+}
+
+static void show_startup_splash(void)
+{
+    SceUID file;
+    void *image;
+    unsigned int loaded = 0;
+    const unsigned int image_size = 512 * 512 * 4;
+
+    file = sceIoOpen("ms0:/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA", PSP_O_RDONLY, 0);
+    if (file < 0)
+        goto black_fallback;
+
+    image = memalign(64, image_size);
+    if (!image) {
+        sceIoClose(file);
+        goto black_fallback;
+    }
+
+    while (loaded < image_size) {
+        int n = sceIoRead(file, (unsigned char *)image + loaded, image_size - loaded);
+        if (n <= 0)
+            break;
+        loaded += (unsigned int)n;
+    }
+    sceIoClose(file);
+
+    if (loaded != image_size) {
+        free(image);
+        goto black_fallback;
+    }
+
+    gu_video_init();
+    gu_video_frame(image);
+    sceKernelDelayThread(3 * 1000 * 1000);
+
+    /* Hold a clean black frame for two seconds before the intro starts. */
+    sceGuStart(GU_DIRECT, gu_list);
+    sceGuClearColor(0xFF000000);
+    sceGuClear(GU_COLOR_BUFFER_BIT);
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceDisplayWaitVblankStart();
+    sceGuSwapBuffers();
+    sceKernelDelayThread(2 * 1000 * 1000);
+
+    sceGuTerm();
+    pspDebugScreenInit();
+    free(image);
+    return;
+
+black_fallback:
+    /* Missing splash asset should not prevent the actual intro from playing. */
+    pspDebugScreenInit();
+    sceKernelDelayThread(2 * 1000 * 1000);
 }
 
 static int wait_audio(PcmOutput *audio, unsigned int pts)
@@ -292,7 +348,6 @@ static int play_intro(void)
     audio.thread = -1;
     audio.channel = -1;
 
-    draw_page("LOADING INTRO", "Opening the in-game PMF video and soundtrack...");
     file = sceIoOpen(PMF_PATH, PSP_O_RDONLY, 0);
     if (file < 0) goto cleanup;
     if (sceIoRead(file, header, sizeof(header)) != (int)sizeof(header)) goto cleanup;
@@ -432,10 +487,29 @@ int main(void)
     SceCtrlData pad;
     unsigned int previous = 0;
     int selected = 0;
+    int startup_status;
+
     setup_callbacks();
     sceCtrlSetSamplingCycle(0);
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
     pspDebugScreenInit();
+
+    /* Automatic boot sequence: splash (3 s), black (2 s), then intro. */
+    show_startup_splash();
+    startup_status = play_intro();
+    if (startup_status < 0) {
+        draw_page("INTRO PLAYER ERROR",
+                  "The automatic intro could not be played.\n"
+                  "Check that INTRO.PMF and INTRO.PCM are beside EBOOT.PBP.");
+        for (;;) {
+            sceCtrlReadBufferPositive(&pad, 1);
+            if (pad.Buttons & PSP_CTRL_CIRCLE)
+                break;
+            sceKernelDelayThread(1000 * 1000 / 60);
+        }
+    }
+
+    selected = 0;
     draw_menu(selected);
 
     for (;;) {

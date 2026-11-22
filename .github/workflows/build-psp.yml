@@ -40,6 +40,15 @@ jobs:
             --output "build/LBPPSP_ALPHA_INTRO.PMF" \
             --audio-output "build/LBPPSP_ALPHA_INTRO.PCM"
 
+      - name: Convert loading screen PNG to PSP texture
+        run: |
+          ffmpeg -hide_banner -loglevel error -y \
+            -i "LBPPSP_Alpha_LoadingScreen.png" \
+            -vf "scale=480:272:flags=lanczos,format=rgba,pad=512:512:0:0:color=black" \
+            -frames:v 1 -pix_fmt rgba -f rawvideo "build/LOADING.RGBA"
+          test "$(stat -c%s build/LOADING.RGBA)" -eq 1048576
+
+
       - name: Clean PSP build
         run: |
           docker pull pspdev/pspdev:latest
@@ -64,18 +73,21 @@ jobs:
           cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
           cp build/LBPPSP_ALPHA_INTRO.PMF dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF
           cp build/LBPPSP_ALPHA_INTRO.PCM dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
+          cp build/LOADING.RGBA dist/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA
           cat > dist/README.txt <<'EOF2'
           LBPPSP Alpha - PSP homebrew build
 
           Copy the PSP folder to the root of the Memory Stick.
           Start the application under Game > Memory Stick.
 
-          Select "Play Intro Video" to play the 480x272 cutscene inside the app.
-          X pauses/resumes the cutscene. O returns to the app menu.
+          On launch: the loading-screen image appears for 3 seconds, then
+          the screen stays black for 2 seconds, then the intro starts automatically.
+          X pauses/resumes the cutscene. O stops playback and opens the menu.
 
-          Keep INTRO.PMF and INTRO.PCM in the same folder as EBOOT.PBP.
+          Keep INTRO.PMF, INTRO.PCM and LOADING.RGBA beside EBOOT.PBP.
           INTRO.PMF contains the H.264 video; INTRO.PCM is its synchronized
-          44.1 kHz stereo soundtrack used by the in-game audio thread.
+          44.1 kHz stereo soundtrack. LOADING.RGBA is the 512x512 PSP texture
+          generated from the repository's loading-screen PNG.
 
           This is still a bootable prototype shell, not the complete original
           LittleBigPlanet game or its original gameplay systems.
@@ -90,6 +102,7 @@ jobs:
             psp/EBOOT.PBP
             build/LBPPSP_ALPHA_INTRO.PMF
             build/LBPPSP_ALPHA_INTRO.PCM
+            build/LOADING.RGBA
             LBPPSP_ALPHA_build.zip
           if-no-files-found: error
           retention-days: 14
