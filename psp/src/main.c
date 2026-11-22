@@ -161,7 +161,7 @@ static int pcm_thread(SceSize args, void *argp)
             memset((unsigned char *)out->buffer + n, 0, PCM_BYTES - n);
         sceAudioOutputBlocking(out->channel, PSP_AUDIO_VOLUME_MAX, out->buffer);
         out->samples_played += (unsigned int)(n / 4);
-        if (n < PCM_BYTES) {
+        if ((unsigned int)n < PCM_BYTES) {
             out->done = 1;
             break;
         }
