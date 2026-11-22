@@ -21,7 +21,11 @@ PSP_MAIN_THREAD_STACK_SIZE_KB(64);
 #define W 480
 #define H 272
 #define FBW 512
-#define PACKETS 512
+#define PACKETS 32
+#define MPEG_MODE 4
+#define DDRTOP_SIZE 0x200000
+#define DDRTOP_ALIGN 0x400000
+#define DDRTOP_AU_OFFSET 0x10000
 #define SECTOR 2048
 #define PCM_SAMPLES 512
 #define PCM_BYTES (PCM_SAMPLES * 2 * sizeof(short))
@@ -331,11 +335,12 @@ static int play_intro(void)
     SceMpeg mpeg = NULL;
     SceMpegRingbuffer ring;
     SceMpegStream *stream = NULL;
-    SceMpegAu au;
+    SceMpegAu *au = NULL;
     SceMpegAvcMode mode;
     PmfInput input;
     PcmOutput audio;
-    void *rb_mem = NULL, *mpeg_mem = NULL, *es = NULL, *frame = NULL;
+    void *rb_mem = NULL, *mpeg_mem = NULL, *ddrtop = NULL;
+    void *au_es = NULL, *au_mem = NULL, *frame = NULL;
     int rb_size, mpeg_size;
     SceInt32 offset = 0, stream_size = 0, unknown = 0, decode_status = 0;
     unsigned int previous = 0;
@@ -361,22 +366,30 @@ static int play_intro(void)
     mpeginit = 1;
 
     rb_size = sceMpegRingbufferQueryMemSize(PACKETS);
-    mpeg_size = sceMpegQueryMemSize(0);
+    /* 480x272 is the PSP low-resolution AVC path (mode 4). */
+    mpeg_size = sceMpegQueryMemSize(MPEG_MODE);
     if (rb_size <= 0 || mpeg_size <= 0) goto cleanup;
     rb_mem = memalign(64, rb_size);
     mpeg_mem = memalign(64, mpeg_size);
-    if (!rb_mem || !mpeg_mem) goto cleanup;
+    /* sceMpegCreate requires a 4 MiB-aligned, 2 MiB Media Engine workspace. */
+    ddrtop = memalign(DDRTOP_ALIGN, DDRTOP_SIZE);
+    /* The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels. */
+    au_mem = memalign(64, 64);
+    if (!rb_mem || !mpeg_mem || !ddrtop || !au_mem) goto cleanup;
+    memset(au_mem, 0xFF, 64);
+    au = (SceMpegAu *)au_mem;
+    au_es = (unsigned char *)ddrtop + DDRTOP_AU_OFFSET;
 
     input.file = file;
     if (sceMpegRingbufferConstruct(&ring, PACKETS, rb_mem, rb_size,
                                    pmf_read_callback, &input) < 0) goto cleanup;
     rb_ready = 1;
-    if (sceMpegCreate(&mpeg, mpeg_mem, mpeg_size, &ring, FBW, 0, 0) < 0) goto cleanup;
+    if (sceMpegCreate(&mpeg, mpeg_mem, mpeg_size, &ring, FBW,
+                      MPEG_MODE, (SceInt32)ddrtop) < 0) goto cleanup;
     mpeg_ready = 1;
 
     mode.iUnk0 = -1;
     mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
-    sceMpegAvcDecodeMode(&mpeg, &mode);
     if (sceMpegQueryStreamOffset(&mpeg, header, &offset) < 0) goto cleanup;
     if (sceMpegQueryStreamSize(header, &stream_size) < 0) goto cleanup;
     if (offset < (int)sizeof(header) || stream_size <= 0 ||
@@ -394,9 +407,8 @@ static int play_intro(void)
     stream = sceMpegRegistStream(&mpeg, 0, 0);
     if (!stream) goto cleanup;
     stream_ready = 1;
-    es = sceMpegMallocAvcEsBuf(&mpeg);
-    if (!es || sceMpegInitAu(&mpeg, es, &au) < 0) goto cleanup;
-    es_ready = 1;
+    if (sceMpegInitAu(&mpeg, au_es, au) < 0) goto cleanup;
+    if (sceMpegAvcDecodeMode(&mpeg, &mode) < 0) goto cleanup;
 
     frame = (unsigned char *)sceGeEdramGetAddr() + DRAW_BYTES + DISP_BYTES;
     gu_video_init();
@@ -419,16 +431,16 @@ static int play_intro(void)
             int count = available > 32 ? 32 : available;
             sceMpegRingbufferPut(&ring, count, available);
         }
-        got = sceMpegGetAvcAu(&mpeg, stream, &au, &unknown);
+        got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
         if (got == 0) {
-            int decoded = sceMpegAvcDecode(&mpeg, &au, FBW, &frame, &decode_status);
+            int decoded = sceMpegAvcDecode(&mpeg, au, FBW, &frame, &decode_status);
             if (decoded < 0) goto cleanup;
             if (decode_status == 1) {
                 if (!audio_started) {
                     if (pcm_start(&audio) != 0) goto cleanup;
                     audio_started = 1;
                 }
-                if (wait_audio(&audio, au.iPts) < 0) { result = 1; break; }
+                if (wait_audio(&audio, au->iPts) < 0) { result = 1; break; }
                 gu_video_frame(frame);
                 ++frames;
             }
@@ -446,7 +458,7 @@ cleanup:
         sceGuTerm();
         pspDebugScreenInit();
     }
-    if (es_ready) sceMpegFreeAvcEsBuf(&mpeg, es);
+    if (au_mem) free(au_mem);
     if (stream_ready) sceMpegUnRegistStream(mpeg, stream);
     if (mpeg_ready) sceMpegDelete(&mpeg);
     if (rb_ready) sceMpegRingbufferDestruct(&ring);
@@ -455,6 +467,7 @@ cleanup:
     if (avcodec) sceUtilityUnloadAvModule(PSP_AV_MODULE_AVCODEC);
     if (rb_mem) free(rb_mem);
     if (mpeg_mem) free(mpeg_mem);
+    if (ddrtop) free(ddrtop);
     if (file >= 0) sceIoClose(file);
     return result;
 }
