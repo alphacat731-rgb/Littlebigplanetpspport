@@ -9,6 +9,7 @@
 #include <psputility.h>
 #include <psputility_avmodules.h>
 #include <pspmpeg.h>
+#include <psputils.h>
 #include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,6 +34,7 @@ PSP_MAIN_THREAD_STACK_SIZE_KB(64);
 #define PCM_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM"
 #define DRAW_BYTES (FBW * H * 4)
 #define DISP_BYTES (FBW * H * 4)
+#define VIDEO_TEXTURE_BYTES (FBW * 512 * 4)
 
 typedef struct {
     SceUID file;
@@ -55,6 +57,38 @@ typedef struct {
 typedef struct {
     short u, v, x, y, z;
 } VideoVertex;
+
+/* Internal sceMpeg AVC detail structures used by the PSP's YCbCr-to-RGB CSC. */
+typedef struct {
+    SceInt32 unknown0, unknown1, width, height;
+    SceInt32 unknown4, unknown5, unknown6, unknown7, unknown8, unknown9;
+} LbpAvcInfo;
+
+typedef struct {
+    ScePVoid buffer0, buffer1, buffer2, buffer3;
+    ScePVoid buffer4, buffer5, buffer6, buffer7;
+    SceInt32 unknown0, unknown1, unknown2;
+} LbpAvcYuv;
+
+typedef struct {
+    SceInt32 unknown0, unknown1, unknown2, unknown3;
+    LbpAvcInfo *info_buffer;
+    SceInt32 unknown5, unknown6, unknown7, unknown8, unknown9, unknown10;
+    LbpAvcYuv *yuv_buffer;
+    SceInt32 unknown12, unknown13, unknown14, unknown15, unknown16, unknown17;
+    SceInt32 unknown18, unknown19, unknown20, unknown21, unknown22, unknown23;
+} LbpAvcDetail2;
+
+typedef struct {
+    SceInt32 height, width, mode0, mode1;
+    ScePVoid buffer0, buffer1, buffer2, buffer3;
+    ScePVoid buffer4, buffer5, buffer6, buffer7;
+} LbpAvcCsc;
+
+/* Exported by sceMpeg / sceMpegbase, but not declared by the stock PSPSDK headers. */
+extern SceInt32 sceMpegAvcDecodeDetail2(SceMpeg *mpeg, LbpAvcDetail2 **detail);
+extern SceInt32 sceMpegBaseCscAvc(ScePVoid rgb_buffer, SceInt32 unknown,
+                                  SceInt32 buffer_width, LbpAvcCsc *csc);
 
 static unsigned int __attribute__((aligned(16))) gu_list[8192];
 
@@ -340,7 +374,9 @@ static int play_intro(void)
     PmfInput input;
     PcmOutput audio;
     void *rb_mem = NULL, *mpeg_mem = NULL, *ddrtop = NULL;
-    void *au_es = NULL, *au_mem = NULL, *frame = NULL;
+    void *au_es = NULL, *au_mem = NULL, *frame = NULL, *frame_uncached = NULL;
+    LbpAvcDetail2 *detail2 = NULL;
+    LbpAvcCsc csc;
     int rb_size, mpeg_size;
     SceInt32 offset = 0, stream_size = 0, unknown = 0, decode_status = 0;
     unsigned int previous = 0;
@@ -410,7 +446,14 @@ static int play_intro(void)
     if (sceMpegInitAu(&mpeg, au_es, au) < 0) goto cleanup;
     if (sceMpegAvcDecodeMode(&mpeg, &mode) < 0) goto cleanup;
 
-    frame = (unsigned char *)sceGeEdramGetAddr() + DRAW_BYTES + DISP_BYTES;
+    /*
+     * Keep the converted RGBA texture in main RAM. A 512x512 texture is
+     * required by the GU, even though the visible video is only 480x272.
+     */
+    frame = memalign(64, VIDEO_TEXTURE_BYTES);
+    if (!frame) goto cleanup;
+    memset(frame, 0, VIDEO_TEXTURE_BYTES);
+    frame_uncached = (void *)(((unsigned int)frame) | 0x40000000u);
     gu_video_init();
     gu_ready = 1;
 
@@ -434,9 +477,55 @@ static int play_intro(void)
         }
         got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
         if (got == 0) {
-            int decoded = sceMpegAvcDecode(&mpeg, au, FBW, &frame, &decode_status);
+            int decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &decode_status);
             if (decoded < 0) goto cleanup;
-            if (decode_status == 1) {
+            if (decode_status > 0) {
+                unsigned int x, y;
+                unsigned int *pixels;
+                LbpAvcInfo *info;
+                LbpAvcYuv *yuv;
+
+                if (sceMpegAvcDecodeDetail2(&mpeg, &detail2) < 0 ||
+                    !detail2 || !detail2->info_buffer || !detail2->yuv_buffer)
+                    goto cleanup;
+
+                info = detail2->info_buffer;
+                yuv = detail2->yuv_buffer;
+                memset(&csc, 0, sizeof(csc));
+                csc.width = (info->width + 15) >> 4;
+                csc.height = (info->height + 15) >> 4;
+                csc.mode0 = 0;
+                csc.mode1 = 0;
+                csc.buffer0 = yuv->buffer0;
+                csc.buffer1 = yuv->buffer1;
+                csc.buffer2 = yuv->buffer2;
+                csc.buffer3 = yuv->buffer3;
+                csc.buffer4 = yuv->buffer4;
+                csc.buffer5 = yuv->buffer5;
+                csc.buffer6 = yuv->buffer6;
+                csc.buffer7 = yuv->buffer7;
+                if (csc.width <= 0 || csc.height <= 0 ||
+                    csc.width > 32 || csc.height > 32)
+                    goto cleanup;
+
+                /*
+                 * The AVC engine leaves frames in YCbCr. Convert them to
+                 * ABGR8888 before passing the texture to the Graphics Engine.
+                 * Use an uncached alias for the Media Engine's CSC output.
+                 */
+                sceKernelDcacheWritebackInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+                if (sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc) < 0)
+                    goto cleanup;
+                sceKernelDcacheInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+
+                /* The hardware CSC writes alpha as zero; make pixels opaque. */
+                pixels = (unsigned int *)frame;
+                for (y = 0; y < H; ++y) {
+                    for (x = 0; x < W; ++x)
+                        pixels[y * FBW + x] |= 0xFF000000u;
+                }
+                sceKernelDcacheWritebackInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+
                 if (!audio_started) {
                     if (pcm_start(&audio) != 0) goto cleanup;
                     audio_started = 1;
@@ -469,6 +558,7 @@ cleanup:
     if (rb_mem) free(rb_mem);
     if (mpeg_mem) free(mpeg_mem);
     if (ddrtop) free(ddrtop);
+    if (frame) free(frame);
     if (file >= 0) sceIoClose(file);
     return result;
 }
