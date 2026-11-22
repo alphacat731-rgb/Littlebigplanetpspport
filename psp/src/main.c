@@ -157,7 +157,7 @@ static int pcm_thread(SceSize args, void *argp)
             out->done = 1;
             break;
         }
-        if (n < PCM_BYTES)
+        if ((unsigned int)n < PCM_BYTES)
             memset((unsigned char *)out->buffer + n, 0, PCM_BYTES - n);
         sceAudioOutputBlocking(out->channel, PSP_AUDIO_VOLUME_MAX, out->buffer);
         out->samples_played += (unsigned int)(n / 4);
@@ -280,7 +280,8 @@ static int play_intro(void)
     PmfInput input;
     PcmOutput audio;
     void *rb_mem = NULL, *mpeg_mem = NULL, *es = NULL, *frame = NULL;
-    int rb_size, mpeg_size, offset = 0, stream_size = 0, unknown = 0, decode_status = 0;
+    int rb_size, mpeg_size;
+    SceInt32 offset = 0, stream_size = 0, unknown = 0, decode_status = 0;
     unsigned int previous = 0;
     int audio_started = 0, frames = 0;
 
