@@ -1,0 +1,89 @@
+name: Build LBPPSP Alpha
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Convert media and build PSP EBOOT
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Validate source assets
+        run: python scripts/validate_assets.py --ffprobe ffprobe
+
+      - name: Convert intro to PSP-compatible MP4
+        run: |
+          python scripts/convert_intro.py \
+            --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
+            --output "build/LBPPSP_ALPHA_INTRO.MP4"
+
+      - name: Clean PSP build
+        run: |
+          docker pull pspdev/pspdev:latest
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace/psp \
+            pspdev/pspdev:latest make clean
+
+      - name: Compile and package EBOOT.PBP
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/workspace" \
+            -w /workspace/psp \
+            pspdev/pspdev:latest make
+
+      - name: Validate bootable PBP structure
+        run: python scripts/validate_pbp.py psp/EBOOT.PBP
+
+      - name: Assemble Memory Stick layout
+        run: |
+          mkdir -p dist/PSP/GAME/LBPPSP_ALPHA
+          mkdir -p dist/VIDEO
+          cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
+          cp build/LBPPSP_ALPHA_INTRO.MP4 dist/VIDEO/LBPPSP_ALPHA_INTRO.MP4
+          cat > dist/README.txt <<'EOF'
+          LBPPSP Alpha - PSP homebrew build
+
+          Copy the PSP folder to the root of the Memory Stick.
+          The application will appear under Game > Memory Stick.
+
+          Copy the VIDEO folder to the root of the Memory Stick.
+          The converted intro can be opened from the PSP XMB Video menu.
+
+          Note: this initial EBOOT is a bootable menu/prototype shell.
+          It does not yet decode or play the intro from inside the application.
+          EOF
+          zip -qr LBPPSP_ALPHA_build.zip dist
+
+      - name: Upload PSP build
+        uses: actions/upload-artifact@v4
+        with:
+          name: LBPPSP-Alpha-PSP-build
+          path: |
+            psp/EBOOT.PBP
+            build/LBPPSP_ALPHA_INTRO.MP4
+            LBPPSP_ALPHA_build.zip
+          if-no-files-found: error
+          retention-days: 14

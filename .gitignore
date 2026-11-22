@@ -1,0 +1,15 @@
+# PSP build outputs
+psp/EBOOT.PBP
+psp/*.elf
+psp/*.prx
+psp/*.o
+psp/*.S
+psp/*.lst
+psp/*.map
+psp/*.sym
+psp/*.sfo
+psp/*.PBP
+psp/obj/
+build/
+dist/
+*.part
