@@ -6,7 +6,7 @@ CFLAGS = -O2 -G0 -Wall -Wextra
 CXXFLAGS = $(CFLAGS) -fno-exceptions -fno-rtti
 ASFLAGS = $(CFLAGS)
 LDFLAGS =
-LIBS = -lpspmpeg -lpspaudio -lpspgu -lm
+LIBS = -lpspmpegbase -lpspmpeg -lpspaudio -lpspgu -lm
 
 BUILD_PRX = 1
 EXTRA_TARGETS = EBOOT.PBP
