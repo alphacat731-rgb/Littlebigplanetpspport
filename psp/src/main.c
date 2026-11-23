@@ -601,9 +601,12 @@ static int play_intro(void)
             int count = available > 32 ? 32 : available;
             last_playback_stage = "Filling MPEG ringbuffer";
             { int ret = sceMpegRingbufferPut(&ring, count, available);
+              if (input.read_error < 0) {
+                  set_playback_failure("Reading PMF ringbuffer data", input.read_error);
+                  goto cleanup;
+              }
               if (ret < 0) {
-                  set_playback_failure("Filling MPEG ringbuffer",
-                                       input.read_error < 0 ? input.read_error : ret);
+                  set_playback_failure("Filling MPEG ringbuffer", ret);
                   goto cleanup;
               }
             }
@@ -632,7 +635,7 @@ static int play_intro(void)
                 playback_log(logbuf);
                 first_decode_logged = 1;
             }
-            if (decoded < 0) { set_playback_failure("Decoding AVC frame", decoded); goto cleanup; }
+            if (decoded != 0) { set_playback_failure("Decoding AVC frame", decoded); goto cleanup; }
             if (pic_num > 0) {
                 unsigned int x, y;
                 unsigned int *pixels;
@@ -641,7 +644,7 @@ static int play_intro(void)
 
                 last_playback_stage = "Reading decoded-frame details";
                 { int ret = sceMpegAvcDecodeDetail2(&mpeg, &detail2);
-                  if (ret < 0 || !detail2 || !detail2->info_buffer || !detail2->yuv_buffer) {
+                  if (ret != 0 || !detail2 || !detail2->info_buffer || !detail2->yuv_buffer) {
                       set_playback_failure("Reading decoded-frame details", ret < 0 ? ret : -6);
                       goto cleanup;
                   }
@@ -677,7 +680,7 @@ static int play_intro(void)
                 last_playback_stage = "Converting decoded frame to RGB";
                 if (!first_csc_logged) playback_log("Entering sceMpegBaseCscAvc");
                 { SceInt32 csc_result = sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
-                  if (csc_result < 0) {
+                  if (csc_result != 0) {
                       set_playback_failure("Converting decoded frame to RGB", csc_result);
                       goto cleanup;
                   }
