@@ -28,6 +28,8 @@ PSP_MAIN_THREAD_STACK_SIZE_KB(64);
 #define DDRTOP_ALIGN 0x400000
 #define DDRTOP_AU_OFFSET 0x10000
 #define SECTOR 2048
+/* sceMpegGetAvcAu returns this while the ringbuffer has no complete AU yet. */
+#define LBP_MPEG_ERROR_NOT_COMPLETED 0x80618001u
 #define PCM_SAMPLES 512
 #define PCM_BYTES (PCM_SAMPLES * 2 * sizeof(short))
 #define PMF_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF"
@@ -643,7 +645,16 @@ static int play_intro(void)
         }
         last_playback_stage = "Reading next AVC access unit";
         got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
-        if (got < 0) { set_playback_failure("Reading AVC access unit", got); goto cleanup; }
+        /*
+         * 0x80618001 is the normal "not completed/no data yet" result while
+         * sceMpeg's ringbuffer is being filled. It is retryable, not a decoder
+         * failure. PPSSPP returns it before its asynchronous ringbuffer callback
+         * has supplied the first complete access unit.
+         */
+        if (got < 0 && (SceUInt32)got != LBP_MPEG_ERROR_NOT_COMPLETED) {
+            set_playback_failure("Reading AVC access unit", got);
+            goto cleanup;
+        }
         if (got != 0) {
             ++au_wait_polls;
             if (au_wait_polls == 1 || (au_wait_polls % 120) == 0) {
