@@ -43,6 +43,7 @@ typedef struct {
     unsigned int total;
     unsigned int read_bytes;
     int eof;
+    int read_error;
 } PmfInput;
 
 typedef struct {
@@ -120,16 +121,38 @@ static void setup_callbacks(void)
     if (th >= 0) sceKernelStartThread(th, 0, NULL);
 }
 
+static int playback_log_to(const char *path, const char *message)
+{
+    SceUID fd;
+    size_t length = strlen(message);
+    size_t written = 0;
+
+    fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
+    if (fd < 0)
+        return fd;
+
+    while (written < length) {
+        int n = sceIoWrite(fd, message + written, (unsigned int)(length - written));
+        if (n <= 0) {
+            sceIoClose(fd);
+            return n < 0 ? n : -1;
+        }
+        written += (size_t)n;
+    }
+
+    if (sceIoWrite(fd, "\n", 1) != 1) {
+        sceIoClose(fd);
+        return -1;
+    }
+
+    return sceIoClose(fd);
+}
+
 static void playback_log(const char *message)
 {
-    SceUID fd = sceIoOpen(LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
-    if (fd < 0)
-        fd = sceIoOpen(ROOT_LOG_PATH, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
-    if (fd >= 0) {
-        sceIoWrite(fd, message, strlen(message));
-        sceIoWrite(fd, "\n", 1);
-        sceIoClose(fd);
-    }
+    /* Fall back if opening OR writing the game-folder log fails. */
+    if (playback_log_to(LOG_PATH, message) < 0)
+        (void)playback_log_to(ROOT_LOG_PATH, message);
 }
 
 static void set_playback_failure(const char *stage, int error)
@@ -193,6 +216,7 @@ static SceInt32 pmf_read_callback(ScePVoid data, SceInt32 packets, ScePVoid para
         int n = sceIoRead(in->file, (unsigned char *)data + got, wanted - got);
         if (n <= 0) {
             in->eof = 1;
+            in->read_error = n < 0 ? n : -10;
             break;
         }
         got += (unsigned int)n;
@@ -200,6 +224,8 @@ static SceInt32 pmf_read_callback(ScePVoid data, SceInt32 packets, ScePVoid para
     in->read_bytes += got;
     if (got != wanted || (got % SECTOR) != 0) {
         in->eof = 1;
+        if (in->read_error == 0)
+            in->read_error = -11;
         return -1;
     }
     return (SceInt32)(got / SECTOR);
@@ -400,7 +426,6 @@ static int play_intro(void)
     PcmOutput audio;
     void *rb_mem = NULL, *mpeg_mem = NULL, *ddrtop = NULL;
     void *au_es = NULL, *au_mem = NULL, *frame = NULL, *frame_uncached = NULL;
-    void *decode_buffer = NULL;
     LbpAvcDetail2 *detail2 = NULL;
     LbpAvcCsc csc;
     int rb_size, mpeg_size;
@@ -492,14 +517,27 @@ static int play_intro(void)
     { int ret = sceMpegQueryStreamSize(header, &stream_size);
       if (ret < 0) { set_playback_failure("Reading PMF stream size", ret); goto cleanup; }
     }
-    if (offset < (int)sizeof(header) || stream_size <= 0 ||
-        (stream_size % SECTOR) != 0) goto cleanup;
+    if (offset < (int)sizeof(header)) {
+        set_playback_failure("Validating PMF stream offset", -9);
+        goto cleanup;
+    }
+    if (stream_size <= 0) {
+        set_playback_failure("Validating PMF stream size", -10);
+        goto cleanup;
+    }
+    if ((stream_size % SECTOR) != 0) {
+        set_playback_failure("Validating PMF sector alignment", -11);
+        goto cleanup;
+    }
     if (offset > (int)sizeof(header)) {
         int skip = offset - (int)sizeof(header);
         unsigned char scratch[512];
         while (skip > 0) {
             int n = sceIoRead(file, scratch, skip > (int)sizeof(scratch) ? (int)sizeof(scratch) : skip);
-            if (n <= 0) goto cleanup;
+            if (n <= 0) {
+                set_playback_failure("Skipping PMF stream padding", n < 0 ? n : -12);
+                goto cleanup;
+            }
             skip -= n;
         }
     }
@@ -524,11 +562,9 @@ static int play_intro(void)
      * required by the GU, even though the visible video is only 480x272.
      */
     frame = memalign(64, VIDEO_TEXTURE_BYTES);
-    decode_buffer = memalign(64, VIDEO_TEXTURE_BYTES);
-    last_playback_stage = "Allocating video frame buffers";
-    if (!frame || !decode_buffer) { set_playback_failure("Allocating video frame buffers", -5); goto cleanup; }
+    last_playback_stage = "Allocating video frame buffer";
+    if (!frame) { set_playback_failure("Allocating video frame buffer", -5); goto cleanup; }
     memset(frame, 0, VIDEO_TEXTURE_BYTES);
-    memset(decode_buffer, 0, VIDEO_TEXTURE_BYTES);
     frame_uncached = (void *)(((unsigned int)frame) | 0x40000000u);
     gu_video_init();
     gu_ready = 1;
@@ -557,11 +593,19 @@ static int play_intro(void)
         if (audio.paused) { sceKernelDelayThread(1000); continue; }
 
         available = sceMpegRingbufferAvailableSize(&ring);
+        if (available < 0) {
+            set_playback_failure("Querying MPEG ringbuffer availability", available);
+            goto cleanup;
+        }
         if (available > 0) {
             int count = available > 32 ? 32 : available;
             last_playback_stage = "Filling MPEG ringbuffer";
             { int ret = sceMpegRingbufferPut(&ring, count, available);
-              if (ret < 0) { set_playback_failure("Filling MPEG ringbuffer", ret); goto cleanup; }
+              if (ret < 0) {
+                  set_playback_failure("Filling MPEG ringbuffer",
+                                       input.read_error < 0 ? input.read_error : ret);
+                  goto cleanup;
+              }
             }
         }
         last_playback_stage = "Reading next AVC access unit";
@@ -569,20 +613,20 @@ static int play_intro(void)
         if (got < 0) { set_playback_failure("Reading AVC access unit", got); goto cleanup; }
         if (got == 0) {
             int decoded;
-            void *decode_output = decode_buffer;
-            void *decode_output_arg = &decode_output;
-
             if (!first_au_logged) {
                 playback_log("First AVC access unit acquired");
                 first_au_logged = 1;
             }
-            /* sceMpegAvcDecode expects a pointer to the output-buffer pointer,
-               not NULL. Keep its scratch buffer separate from the CSC texture. */
+            /*
+             * Match the established PMPlayer AVC path: pBuffer is NULL here.
+             * The decoded YCbCr planes are obtained from DecodeDetail2 below,
+             * then converted into the GU texture by sceMpegBaseCscAvc.
+             */
             sceKernelDcacheWritebackInvalidateAll();
             if (!first_decode_logged)
                 playback_log("Entering sceMpegAvcDecode");
             last_playback_stage = "Decoding first AVC frame";
-            decoded = sceMpegAvcDecode(&mpeg, au, FBW, decode_output_arg, &pic_num);
+            decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &pic_num);
             if (!first_decode_logged) {
                 snprintf(logbuf, sizeof(logbuf), "First AVC decode returned: ret=%d pic_num=%d", decoded, pic_num);
                 playback_log(logbuf);
@@ -633,7 +677,10 @@ static int play_intro(void)
                 last_playback_stage = "Converting decoded frame to RGB";
                 if (!first_csc_logged) playback_log("Entering sceMpegBaseCscAvc");
                 { SceInt32 csc_result = sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
-                  if (csc_result < 0) { snprintf(logbuf, sizeof(logbuf), "ERROR: CSC returned %d", csc_result); playback_log(logbuf); goto cleanup; }
+                  if (csc_result < 0) {
+                      set_playback_failure("Converting decoded frame to RGB", csc_result);
+                      goto cleanup;
+                  }
                 }
                 if (!first_csc_logged) { playback_log("First CSC conversion succeeded"); first_csc_logged = 1; }
                 sceKernelDcacheInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
@@ -683,7 +730,6 @@ cleanup:
     if (mpeg_mem) free(mpeg_mem);
     if (ddrtop) free(ddrtop);
     if (frame) free(frame);
-    if (decode_buffer) free(decode_buffer);
     if (file >= 0) sceIoClose(file);
     return result;
 }
