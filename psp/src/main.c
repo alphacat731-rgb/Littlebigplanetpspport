@@ -451,6 +451,7 @@ static int play_intro(void)
     SceInt32 offset = 0, stream_size = 0, unknown = 0, pic_num = 0;
     unsigned int previous = 0;
     int audio_started = 0, frames = 0;
+    int decode_calls = 0, zero_pic_calls = 0, au_wait_polls = 0;
     int first_au_logged = 0, first_decode_logged = 0, first_csc_logged = 0;
     unsigned long long first_frame_wait_start = 0;
     char logbuf[128];
@@ -643,7 +644,21 @@ static int play_intro(void)
         last_playback_stage = "Reading next AVC access unit";
         got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
         if (got < 0) { set_playback_failure("Reading AVC access unit", got); goto cleanup; }
-        if (got == 0) {
+        if (got != 0) {
+            ++au_wait_polls;
+            if (au_wait_polls == 1 || (au_wait_polls % 120) == 0) {
+                snprintf(logbuf, sizeof(logbuf),
+                         "AVC AU pending: ret=%d polls=%d input=%u/%u frames=%d",
+                         got, au_wait_polls, input.read_bytes, input.total, frames);
+                playback_log(logbuf);
+            }
+        } else {
+            if (au_wait_polls > 0) {
+                snprintf(logbuf, sizeof(logbuf),
+                         "AVC AU resumed after %d pending polls", au_wait_polls);
+                playback_log(logbuf);
+            }
+            au_wait_polls = 0;
             int decoded;
             if (!first_au_logged) {
                 playback_log("First AVC access unit acquired");
@@ -665,18 +680,30 @@ static int play_intro(void)
                 decoded = sceMpegAvcDecode(&mpeg, au, FBW,
                                             decode_output_arg, &pic_num);
             }
-            if (!first_decode_logged) {
+            ++decode_calls;
+            if (decode_calls == 1 || (decode_calls % 30) == 0) {
                 snprintf(logbuf, sizeof(logbuf),
-                         "First AVC decode returned: ret=%d pic_num=%d",
-                         decoded, (int)pic_num);
+                         "AVC decode #%d: ret=%d pic_num=%d pts=%u input=%u/%u",
+                         decode_calls, decoded, (int)pic_num,
+                         (unsigned int)au->iPts, input.read_bytes, input.total);
                 playback_log(logbuf);
-                first_decode_logged = 1;
             }
+            if (!first_decode_logged)
+                first_decode_logged = 1;
             if (decoded != 0) {
                 set_playback_failure("Decoding AVC frame", decoded);
                 goto cleanup;
             }
 
+            if (pic_num <= 0) {
+                ++zero_pic_calls;
+                if (zero_pic_calls == 1 || (zero_pic_calls % 30) == 0) {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "AVC decode produced no frame: calls=%d no_frame=%d pts=%u",
+                             decode_calls, zero_pic_calls, (unsigned int)au->iPts);
+                    playback_log(logbuf);
+                }
+            }
             if (pic_num > 0) {
                 unsigned int x, y;
                 unsigned int *pixels;
@@ -765,10 +792,33 @@ static int play_intro(void)
                 sceKernelDcacheWritebackInvalidateRange(frame,
                                                         VIDEO_TEXTURE_BYTES);
 
+                if (frames == 0) {
+                    unsigned int nonblack = 0;
+                    unsigned int checksum = 2166136261u;
+                    for (y = 0; y < H; ++y) {
+                        for (x = 0; x < W; ++x) {
+                            unsigned int pixel = pixels[y * FBW + x];
+                            checksum = (checksum ^ pixel) * 16777619u;
+                            if ((pixel & 0x00FFFFFFu) != 0)
+                                ++nonblack;
+                        }
+                    }
+                    snprintf(logbuf, sizeof(logbuf),
+                             "First frame pixels: hash=%08X nonblack=%u/%u p0=%08X pc=%08X",
+                             checksum, nonblack, (unsigned int)(W * H),
+                             pixels[0], pixels[(H / 2) * FBW + (W / 2)]);
+                    playback_log(logbuf);
+                }
+
                 if (audio_started && wait_audio(&audio, au->iPts) < 0) { result = 1; break; }
                 gu_video_frame(frame);
                 ++frames;
-                if (frames == 1) playback_log("First video frame displayed");
+                if (frames == 1 || (frames % 30) == 0) {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "GU frame submitted: frames=%d pts=%u",
+                             frames, (unsigned int)au->iPts);
+                    playback_log(logbuf);
+                }
             }
         } else {
             if (input.eof && sceMpegRingbufferAvailableSize(&ring) >= PACKETS)
@@ -784,7 +834,10 @@ static int play_intro(void)
     if (frames > 0 && result == -1) result = 0;
 
 cleanup:
-    snprintf(logbuf, sizeof(logbuf), "Playback cleanup: result=%d frames=%d", result, frames);
+    snprintf(logbuf, sizeof(logbuf),
+             "Playback cleanup: result=%d frames=%d decodes=%d no_frame=%d au_wait=%d input=%u/%u",
+             result, frames, decode_calls, zero_pic_calls, au_wait_polls,
+             input.read_bytes, input.total);
     playback_log(logbuf);
     pcm_stop(&audio);
     if (gu_ready) {
