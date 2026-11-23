@@ -716,11 +716,6 @@ static int play_intro(void)
                     playback_log(logbuf);
                 }
             }
-                if (decoded == 0) {
-                    direct_output_fallback = 1;
-                    playback_log("Using PPSSPP direct-ABGR decode fallback");
-                }
-            }
             if (!first_decode_logged)
                 first_decode_logged = 1;
             if (decoded != 0) {
