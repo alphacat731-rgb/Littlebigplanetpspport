@@ -677,19 +677,27 @@ static int play_intro(void)
             }
 
             /*
-             * PPSSPP's sceMpeg HLE dereferences pBuffer to obtain the
-             * framebuffer address, so pass the address of a pointer variable.
-             * The pointed-to allocation receives the decoded ABGR image.
+             * The established PSP/PMPlayer path passes NULL here and obtains
+             * the Media Engine's YCbCr planes through sceMpegAvcDecodeDetail2.
+             * PPSSPP's current HLE instead requires pBuffer to point to a PSP
+             * pointer variable and returns -1 for NULL. Try the real-hardware
+             * ABI first, then use the HLE-only direct-ABGR fallback on that
+             * exact invalid-address result.
              */
             sceKernelDcacheWritebackInvalidateAll();
             if (!first_decode_logged)
                 playback_log("Entering sceMpegAvcDecode");
             last_playback_stage = "Decoding first AVC frame";
-            {
+            pic_num = 0;
+            decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &pic_num);
+            if (decoded == -1) {
                 void *decode_output = decode_buffer;
                 void *decode_output_arg = &decode_output;
+                pic_num = 0;
                 decoded = sceMpegAvcDecode(&mpeg, au, FBW,
                                             decode_output_arg, &pic_num);
+                if (decoded == 0)
+                    playback_log("Using PPSSPP direct-ABGR decode fallback");
             }
             ++decode_calls;
             if (decode_calls == 1 || (decode_calls % 30) == 0) {
@@ -718,25 +726,32 @@ static int play_intro(void)
             if (pic_num > 0) {
                 unsigned int x, y;
                 unsigned int *pixels;
-                int use_csc = 0;
-                int detail_result;
+                if (decoded == -1) {
+                    /* The direct-output HLE path was selected above. */
+                    sceKernelDcacheInvalidateRange(decode_buffer,
+                                                   VIDEO_TEXTURE_BYTES);
+                    memcpy(frame, decode_buffer, VIDEO_TEXTURE_BYTES);
+                    last_playback_stage = "Preparing direct decoded frame";
+                } else {
+                    LbpAvcInfo *info;
+                    LbpAvcYuv *yuv;
+                    SceInt32 csc_result;
 
-                /*
-                 * Real PSP firmware can expose the Media Engine's decoded
-                 * YCbCr planes through Detail2. PPSSPP currently leaves this
-                 * function unimplemented, but its sceMpegAvcDecode writes a
-                 * ready-to-display ABGR frame to decode_buffer. Treat Detail2
-                 * as an optional hardware path, never as a playback blocker.
-                 */
-                detail2 = NULL;
-                last_playback_stage = "Reading decoded-frame details";
-                detail_result = sceMpegAvcDecodeDetail2(&mpeg, &detail2);
+                    detail2 = NULL;
+                    last_playback_stage = "Reading decoded-frame details";
+                    {
+                        int detail_result =
+                            sceMpegAvcDecodeDetail2(&mpeg, &detail2);
+                        if (detail_result != 0 || !detail2 ||
+                            !detail2->info_buffer || !detail2->yuv_buffer) {
+                            set_playback_failure("Reading decoded-frame details",
+                                                 detail_result != 0 ? detail_result : -6);
+                            goto cleanup;
+                        }
+                    }
 
-                if (detail_result == 0 && detail2 &&
-                    detail2->info_buffer && detail2->yuv_buffer) {
-                    LbpAvcInfo *info = detail2->info_buffer;
-                    LbpAvcYuv *yuv = detail2->yuv_buffer;
-
+                    info = detail2->info_buffer;
+                    yuv = detail2->yuv_buffer;
                     memset(&csc, 0, sizeof(csc));
                     csc.width = (info->width + 15) >> 4;
                     csc.height = (info->height + 15) >> 4;
@@ -751,47 +766,26 @@ static int play_intro(void)
                     csc.buffer6 = yuv->buffer6;
                     csc.buffer7 = yuv->buffer7;
 
-                    if (csc.width > 0 && csc.height > 0 &&
-                        csc.width <= 32 && csc.height <= 32) {
-                        sceKernelDcacheWritebackInvalidateAll();
-                        last_playback_stage = "Converting decoded frame to RGB";
-                        if (!first_csc_logged)
-                            playback_log("Entering sceMpegBaseCscAvc");
-                        {
-                            SceInt32 csc_result =
-                                sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
-                            if (csc_result == 0) {
-                                sceKernelDcacheInvalidateRange(frame,
-                                                               VIDEO_TEXTURE_BYTES);
-                                use_csc = 1;
-                                if (!first_csc_logged) {
-                                    playback_log("First CSC conversion succeeded");
-                                    first_csc_logged = 1;
-                                }
-                            } else {
-                                snprintf(logbuf, sizeof(logbuf),
-                                         "CSC unavailable (%ld); using direct decoded frame",
-                                         (long)csc_result);
-                                playback_log(logbuf);
-                            }
-                        }
-                    } else {
-                        playback_log("Invalid AVC detail dimensions; using direct decoded frame");
+                    if (csc.width <= 0 || csc.height <= 0 ||
+                        csc.width > 32 || csc.height > 32) {
+                        set_playback_failure("Checking decoded-frame dimensions", -7);
+                        goto cleanup;
                     }
-                } else {
-                    snprintf(logbuf, sizeof(logbuf),
-                             "AVC Detail2 unavailable (ret=%d, detail=%s); using direct decoded frame",
-                             detail_result, detail2 ? "present but incomplete" : "null");
-                    playback_log(logbuf);
-                }
 
-                if (!use_csc) {
-                    /* PPSSPP and other HLE implementations may provide the
-                       finished ABGR pixels directly through sceMpegAvcDecode. */
-                    sceKernelDcacheInvalidateRange(decode_buffer,
-                                                   VIDEO_TEXTURE_BYTES);
-                    memcpy(frame, decode_buffer, VIDEO_TEXTURE_BYTES);
-                    last_playback_stage = "Preparing direct decoded frame";
+                    sceKernelDcacheWritebackInvalidateAll();
+                    last_playback_stage = "Converting decoded frame to RGB";
+                    if (!first_csc_logged)
+                        playback_log("Entering sceMpegBaseCscAvc");
+                    csc_result = sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
+                    if (csc_result != 0) {
+                        set_playback_failure("Converting decoded frame to RGB", csc_result);
+                        goto cleanup;
+                    }
+                    sceKernelDcacheInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+                    if (!first_csc_logged) {
+                        playback_log("First CSC conversion succeeded");
+                        first_csc_logged = 1;
+                    }
                 }
 
                 /* The PSP CSC path may leave alpha clear; force opaque pixels. */
