@@ -53,6 +53,7 @@ typedef struct {
     volatile int running;
     volatile int paused;
     volatile int done;
+    volatile int error;
     volatile unsigned int samples_played;
     void *buffer;
 } PcmOutput;
@@ -248,7 +249,16 @@ static int pcm_thread(SceSize args, void *argp)
         }
         if ((unsigned int)n < PCM_BYTES)
             memset((unsigned char *)out->buffer + n, 0, PCM_BYTES - n);
-        sceAudioOutputBlocking(out->channel, PSP_AUDIO_VOLUME_MAX, out->buffer);
+        {
+            int output_result = sceAudioOutputBlocking(out->channel,
+                                                       PSP_AUDIO_VOLUME_MAX,
+                                                       out->buffer);
+            if (output_result < 0) {
+                out->error = output_result;
+                out->done = 1;
+                break;
+            }
+        }
         out->samples_played += (unsigned int)(n / 4);
         if ((unsigned int)n < PCM_BYTES) {
             out->done = 1;
@@ -426,6 +436,7 @@ static int play_intro(void)
     PcmOutput audio;
     void *rb_mem = NULL, *mpeg_mem = NULL, *ddrtop = NULL;
     void *au_es = NULL, *au_mem = NULL, *frame = NULL, *frame_uncached = NULL;
+    void *decode_buffer = NULL;
     LbpAvcDetail2 *detail2 = NULL;
     LbpAvcCsc csc;
     int rb_size, mpeg_size;
@@ -562,9 +573,14 @@ static int play_intro(void)
      * required by the GU, even though the visible video is only 480x272.
      */
     frame = memalign(64, VIDEO_TEXTURE_BYTES);
-    last_playback_stage = "Allocating video frame buffer";
-    if (!frame) { set_playback_failure("Allocating video frame buffer", -5); goto cleanup; }
+    decode_buffer = memalign(64, VIDEO_TEXTURE_BYTES);
+    last_playback_stage = "Allocating video frame buffers";
+    if (!frame || !decode_buffer) {
+        set_playback_failure("Allocating video frame buffers", -5);
+        goto cleanup;
+    }
     memset(frame, 0, VIDEO_TEXTURE_BYTES);
+    memset(decode_buffer, 0, VIDEO_TEXTURE_BYTES);
     frame_uncached = (void *)(((unsigned int)frame) | 0x40000000u);
     gu_video_init();
     gu_ready = 1;
@@ -620,81 +636,116 @@ static int play_intro(void)
                 playback_log("First AVC access unit acquired");
                 first_au_logged = 1;
             }
+
             /*
-             * Match the established PMPlayer AVC path: pBuffer is NULL here.
-             * The decoded YCbCr planes are obtained from DecodeDetail2 below,
-             * then converted into the GU texture by sceMpegBaseCscAvc.
+             * sceMpegAvcDecode's documented pBuffer argument is a direct
+             * decoded-frame buffer, not a pointer-to-pointer. This is also
+             * the output path implemented by PPSSPP's sceMpeg HLE.
              */
             sceKernelDcacheWritebackInvalidateAll();
             if (!first_decode_logged)
                 playback_log("Entering sceMpegAvcDecode");
             last_playback_stage = "Decoding first AVC frame";
-            decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &pic_num);
+            decoded = sceMpegAvcDecode(&mpeg, au, FBW, decode_buffer, &pic_num);
             if (!first_decode_logged) {
-                snprintf(logbuf, sizeof(logbuf), "First AVC decode returned: ret=%d pic_num=%d", decoded, pic_num);
+                snprintf(logbuf, sizeof(logbuf),
+                         "First AVC decode returned: ret=%d pic_num=%d",
+                         decoded, (int)pic_num);
                 playback_log(logbuf);
                 first_decode_logged = 1;
             }
-            if (decoded != 0) { set_playback_failure("Decoding AVC frame", decoded); goto cleanup; }
+            if (decoded != 0) {
+                set_playback_failure("Decoding AVC frame", decoded);
+                goto cleanup;
+            }
+
             if (pic_num > 0) {
                 unsigned int x, y;
                 unsigned int *pixels;
-                LbpAvcInfo *info;
-                LbpAvcYuv *yuv;
-
-                last_playback_stage = "Reading decoded-frame details";
-                { int ret = sceMpegAvcDecodeDetail2(&mpeg, &detail2);
-                  if (ret != 0 || !detail2 || !detail2->info_buffer || !detail2->yuv_buffer) {
-                      set_playback_failure("Reading decoded-frame details", ret < 0 ? ret : -6);
-                      goto cleanup;
-                  }
-                }
-
-                info = detail2->info_buffer;
-                yuv = detail2->yuv_buffer;
-                memset(&csc, 0, sizeof(csc));
-                csc.width = (info->width + 15) >> 4;
-                csc.height = (info->height + 15) >> 4;
-                csc.mode0 = 0;
-                csc.mode1 = 0;
-                csc.buffer0 = yuv->buffer0;
-                csc.buffer1 = yuv->buffer1;
-                csc.buffer2 = yuv->buffer2;
-                csc.buffer3 = yuv->buffer3;
-                csc.buffer4 = yuv->buffer4;
-                csc.buffer5 = yuv->buffer5;
-                csc.buffer6 = yuv->buffer6;
-                csc.buffer7 = yuv->buffer7;
-                if (csc.width <= 0 || csc.height <= 0 ||
-                    csc.width > 32 || csc.height > 32) {
-                    set_playback_failure("Checking decoded-frame dimensions", -7);
-                    goto cleanup;
-                }
+                int use_csc = 0;
+                int detail_result;
 
                 /*
-                 * The AVC engine leaves frames in YCbCr. Convert them to
-                 * ABGR8888 before passing the texture to the Graphics Engine.
-                 * Use an uncached alias for the Media Engine's CSC output.
+                 * Real PSP firmware can expose the Media Engine's decoded
+                 * YCbCr planes through Detail2. PPSSPP currently leaves this
+                 * function unimplemented, but its sceMpegAvcDecode writes a
+                 * ready-to-display ABGR frame to decode_buffer. Treat Detail2
+                 * as an optional hardware path, never as a playback blocker.
                  */
-                sceKernelDcacheWritebackInvalidateAll();
-                last_playback_stage = "Converting decoded frame to RGB";
-                if (!first_csc_logged) playback_log("Entering sceMpegBaseCscAvc");
-                { SceInt32 csc_result = sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
-                  if (csc_result != 0) {
-                      set_playback_failure("Converting decoded frame to RGB", csc_result);
-                      goto cleanup;
-                  }
-                }
-                if (!first_csc_logged) { playback_log("First CSC conversion succeeded"); first_csc_logged = 1; }
-                sceKernelDcacheInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+                detail2 = NULL;
+                last_playback_stage = "Reading decoded-frame details";
+                detail_result = sceMpegAvcDecodeDetail2(&mpeg, &detail2);
 
-                /* The hardware CSC writes alpha as zero; make pixels opaque. */
+                if (detail_result == 0 && detail2 &&
+                    detail2->info_buffer && detail2->yuv_buffer) {
+                    LbpAvcInfo *info = detail2->info_buffer;
+                    LbpAvcYuv *yuv = detail2->yuv_buffer;
+
+                    memset(&csc, 0, sizeof(csc));
+                    csc.width = (info->width + 15) >> 4;
+                    csc.height = (info->height + 15) >> 4;
+                    csc.mode0 = 0;
+                    csc.mode1 = 0;
+                    csc.buffer0 = yuv->buffer0;
+                    csc.buffer1 = yuv->buffer1;
+                    csc.buffer2 = yuv->buffer2;
+                    csc.buffer3 = yuv->buffer3;
+                    csc.buffer4 = yuv->buffer4;
+                    csc.buffer5 = yuv->buffer5;
+                    csc.buffer6 = yuv->buffer6;
+                    csc.buffer7 = yuv->buffer7;
+
+                    if (csc.width > 0 && csc.height > 0 &&
+                        csc.width <= 32 && csc.height <= 32) {
+                        sceKernelDcacheWritebackInvalidateAll();
+                        last_playback_stage = "Converting decoded frame to RGB";
+                        if (!first_csc_logged)
+                            playback_log("Entering sceMpegBaseCscAvc");
+                        {
+                            SceInt32 csc_result =
+                                sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
+                            if (csc_result == 0) {
+                                sceKernelDcacheInvalidateRange(frame,
+                                                               VIDEO_TEXTURE_BYTES);
+                                use_csc = 1;
+                                if (!first_csc_logged) {
+                                    playback_log("First CSC conversion succeeded");
+                                    first_csc_logged = 1;
+                                }
+                            } else {
+                                snprintf(logbuf, sizeof(logbuf),
+                                         "CSC unavailable (%ld); using direct decoded frame",
+                                         (long)csc_result);
+                                playback_log(logbuf);
+                            }
+                        }
+                    } else {
+                        playback_log("Invalid AVC detail dimensions; using direct decoded frame");
+                    }
+                } else {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "AVC Detail2 unavailable (ret=%d, detail=%s); using direct decoded frame",
+                             detail_result, detail2 ? "present but incomplete" : "null");
+                    playback_log(logbuf);
+                }
+
+                if (!use_csc) {
+                    /* PPSSPP and other HLE implementations may provide the
+                       finished ABGR pixels directly through sceMpegAvcDecode. */
+                    sceKernelDcacheInvalidateRange(decode_buffer,
+                                                   VIDEO_TEXTURE_BYTES);
+                    memcpy(frame, decode_buffer, VIDEO_TEXTURE_BYTES);
+                    last_playback_stage = "Preparing direct decoded frame";
+                }
+
+                /* The PSP CSC path may leave alpha clear; force opaque pixels. */
                 pixels = (unsigned int *)frame;
                 for (y = 0; y < H; ++y) {
                     for (x = 0; x < W; ++x)
                         pixels[y * FBW + x] |= 0xFF000000u;
                 }
-                sceKernelDcacheWritebackInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+                sceKernelDcacheWritebackInvalidateRange(frame,
+                                                        VIDEO_TEXTURE_BYTES);
 
                 if (audio_started && wait_audio(&audio, au->iPts) < 0) { result = 1; break; }
                 gu_video_frame(frame);
@@ -733,6 +784,7 @@ cleanup:
     if (mpeg_mem) free(mpeg_mem);
     if (ddrtop) free(ddrtop);
     if (frame) free(frame);
+    if (decode_buffer) free(decode_buffer);
     if (file >= 0) sceIoClose(file);
     return result;
 }
