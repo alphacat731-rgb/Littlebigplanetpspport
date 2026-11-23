@@ -671,6 +671,7 @@ static int play_intro(void)
             }
             au_wait_polls = 0;
             int decoded;
+            int direct_output_fallback = 0;
             if (!first_au_logged) {
                 playback_log("First AVC access unit acquired");
                 first_au_logged = 1;
@@ -696,8 +697,10 @@ static int play_intro(void)
                 pic_num = 0;
                 decoded = sceMpegAvcDecode(&mpeg, au, FBW,
                                             decode_output_arg, &pic_num);
-                if (decoded == 0)
+                if (decoded == 0) {
+                    direct_output_fallback = 1;
                     playback_log("Using PPSSPP direct-ABGR decode fallback");
+                }
             }
             ++decode_calls;
             if (decode_calls == 1 || (decode_calls % 30) == 0) {
@@ -726,7 +729,7 @@ static int play_intro(void)
             if (pic_num > 0) {
                 unsigned int x, y;
                 unsigned int *pixels;
-                if (decoded == -1) {
+                if (direct_output_fallback) {
                     /* The direct-output HLE path was selected above. */
                     sceKernelDcacheInvalidateRange(decode_buffer,
                                                    VIDEO_TEXTURE_BYTES);
