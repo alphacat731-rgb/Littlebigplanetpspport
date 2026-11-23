@@ -638,15 +638,20 @@ static int play_intro(void)
             }
 
             /*
-             * sceMpegAvcDecode's documented pBuffer argument is a direct
-             * decoded-frame buffer, not a pointer-to-pointer. This is also
-             * the output path implemented by PPSSPP's sceMpeg HLE.
+             * PPSSPP's sceMpeg HLE dereferences pBuffer to obtain the
+             * framebuffer address, so pass the address of a pointer variable.
+             * The pointed-to allocation receives the decoded ABGR image.
              */
             sceKernelDcacheWritebackInvalidateAll();
             if (!first_decode_logged)
                 playback_log("Entering sceMpegAvcDecode");
             last_playback_stage = "Decoding first AVC frame";
-            decoded = sceMpegAvcDecode(&mpeg, au, FBW, decode_buffer, &pic_num);
+            {
+                void *decode_output = decode_buffer;
+                void *decode_output_arg = &decode_output;
+                decoded = sceMpegAvcDecode(&mpeg, au, FBW,
+                                            decode_output_arg, &pic_num);
+            }
             if (!first_decode_logged) {
                 snprintf(logbuf, sizeof(logbuf),
                          "First AVC decode returned: ret=%d pic_num=%d",
