@@ -244,6 +244,8 @@ static int pcm_thread(SceSize args, void *argp)
         }
         n = sceIoRead(out->file, out->buffer, PCM_BYTES);
         if (n <= 0) {
+            if (n < 0)
+                out->error = n;
             out->done = 1;
             break;
         }
@@ -289,10 +291,16 @@ static int pcm_start(PcmOutput *out)
 
 static void pcm_stop(PcmOutput *out)
 {
+    char message[128];
     out->running = 0;
     if (out->thread >= 0) {
         sceKernelTerminateDeleteThread(out->thread);
         out->thread = -1;
+    }
+    if (out->error < 0) {
+        snprintf(message, sizeof(message), "PCM playback failed: 0x%08X",
+                 (unsigned int)out->error);
+        playback_log(message);
     }
     if (out->channel >= 0) {
         sceAudioChRelease(out->channel);
@@ -588,11 +596,16 @@ static int play_intro(void)
 
     /* Start PCM independently of the first video frame. A decoder failure must
        not suppress the soundtrack or leave the user with a silent splash. */
-    if (pcm_start(&audio) == 0) {
-        audio_started = 1;
-        playback_log("PCM audio thread started");
-    } else {
-        playback_log("WARNING: PCM audio thread could not start");
+    {
+        int pcm_result = pcm_start(&audio);
+        if (pcm_result == 0) {
+            audio_started = 1;
+            playback_log("PCM audio thread started");
+        } else {
+            snprintf(logbuf, sizeof(logbuf),
+                     "WARNING: PCM audio startup failed: %d", pcm_result);
+            playback_log(logbuf);
+        }
     }
     first_frame_wait_start = (unsigned long long)sceKernelGetSystemTimeWide();
 
