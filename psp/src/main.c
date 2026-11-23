@@ -689,26 +689,37 @@ static int play_intro(void)
             if (!first_decode_logged)
                 playback_log("Entering sceMpegAvcDecode");
             last_playback_stage = "Decoding first AVC frame";
-            pic_num = 0;
-            decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &pic_num);
-            if (decoded == -1) {
-                void *decode_output = decode_buffer;
-                void *decode_output_arg = &decode_output;
-                pic_num = 0;
-                decoded = sceMpegAvcDecode(&mpeg, au, FBW,
-                                            decode_output_arg, &pic_num);
+            /*
+             * iInit is persistent decoder state, not a per-frame counter:
+             * PSPSDK documents 0 on the first call and 1 thereafter. Keep
+             * the value written by the decoder across access units.
+             */
+            {
+                int init_before = pic_num;
+                decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &pic_num);
+                if (decoded == -1) {
+                    void *decode_output = decode_buffer;
+                    void *decode_output_arg = &decode_output;
+                    decoded = sceMpegAvcDecode(&mpeg, au, FBW,
+                                                decode_output_arg, &pic_num);
+                    if (decoded == 0) {
+                        direct_output_fallback = 1;
+                        playback_log("Using PPSSPP direct-ABGR decode fallback");
+                    }
+                }
+                ++decode_calls;
+                if (decode_calls == 1 || (decode_calls % 30) == 0) {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "AVC decode #%d: ret=%d iInit=%d->%d pts=%u input=%u/%u",
+                             decode_calls, decoded, init_before, (int)pic_num,
+                             (unsigned int)au->iPts, input.read_bytes, input.total);
+                    playback_log(logbuf);
+                }
+            }
                 if (decoded == 0) {
                     direct_output_fallback = 1;
                     playback_log("Using PPSSPP direct-ABGR decode fallback");
                 }
-            }
-            ++decode_calls;
-            if (decode_calls == 1 || (decode_calls % 30) == 0) {
-                snprintf(logbuf, sizeof(logbuf),
-                         "AVC decode #%d: ret=%d pic_num=%d pts=%u input=%u/%u",
-                         decode_calls, decoded, (int)pic_num,
-                         (unsigned int)au->iPts, input.read_bytes, input.total);
-                playback_log(logbuf);
             }
             if (!first_decode_logged)
                 first_decode_logged = 1;
@@ -853,11 +864,12 @@ cleanup:
         sceGuTerm();
         pspDebugScreenInit();
     }
-    if (au_mem) free(au_mem);
     if (stream_ready) sceMpegUnRegistStream(mpeg, stream);
     if (mpeg_ready) sceMpegDelete(&mpeg);
     if (rb_ready) sceMpegRingbufferDestruct(&ring);
     if (mpeginit) sceMpegFinish();
+    /* Keep the AU descriptor alive until sceMpeg has been deleted. */
+    if (au_mem) free(au_mem);
     if (mpegbase) sceUtilityUnloadAvModule(PSP_AV_MODULE_MPEGBASE);
     if (avcodec) sceUtilityUnloadAvModule(PSP_AV_MODULE_AVCODEC);
     if (rb_mem) free(rb_mem);
