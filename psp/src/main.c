@@ -820,7 +820,8 @@ static int play_intro(void)
                     playback_log(logbuf);
                 }
             }
-        } else {
+        }
+        if (got != 0) {
             if (input.eof && sceMpegRingbufferAvailableSize(&ring) >= PACKETS)
                 break;
             sceKernelDelayThread(1000);
