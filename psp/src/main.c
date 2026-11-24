@@ -677,7 +677,6 @@ static int play_intro(void)
         set_playback_failure("Locating eDRAM frame buffer", -8);
         goto cleanup;
     }
-    sceKernelDcacheWritebackInvalidateAll();
     gu_video_init();
     gu_ready = 1;
 
@@ -733,7 +732,6 @@ static int play_intro(void)
         got = sceMpegGetAvcAu(&mpeg, stream, &au, &unknown);
         if (got == 0) {
             int decoded;
-            sceKernelDcacheWritebackInvalidateAll();
             last_playback_stage = "Decoding AVC frame";
             /*
              * The PSP decoder expects an address of a frame-pointer variable.
@@ -747,7 +745,6 @@ static int play_intro(void)
                 goto cleanup;
             }
             if (decode_status == 1) {
-                sceKernelDcacheInvalidateRange(frame, FRAME_BYTES);
                 if (audio_started && wait_audio(&audio, (unsigned int)au.iPts) < 0) {
                     result = 1;
                     break;
