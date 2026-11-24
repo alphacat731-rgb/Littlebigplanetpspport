@@ -315,7 +315,7 @@ def validate_psmf(path: Path, access_units: list[tuple[bytes, bool]], width: int
     table_size = int.from_bytes(index_data[14:16], "big")
     next_idr = next((i for i in range(1, len(access_units)) if access_units[i][1]), len(access_units))
     expected_sizes = [len(access_units[i][0]) for i in range(next_idr)]
-    indexed_sizes = [int.from_bytes(index_data[18 + 4 * i:20 + 4 * i], "big") for i in range(count)]
+    indexed_sizes = [int.from_bytes(index_data[20 + 4 * i:22 + 4 * i], "big") for i in range(count)]
     if count != len(expected_sizes) or table_size != 2 + 4 * count or indexed_sizes != expected_sizes:
         raise ValueError("First GOP index does not match its H.264 access units")
 
