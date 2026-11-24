@@ -1,4 +1,4 @@
-name: Build LBPPSP Alpha
+name: Rebuild LBPPSP Alpha
 
 on:
   push:
@@ -12,9 +12,9 @@ permissions:
 
 jobs:
   build:
-    name: Convert in-game cutscene and build PSP EBOOT
+    name: Transcode clean MP4, build PMF and compile PSP EBOOT
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
 
     steps:
       - name: Check out source
@@ -30,24 +30,46 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
 
-      - name: Validate source assets
+      - name: Validate original source exists
+        run: |
+          test -s "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4"
+          python - <<'PY'
+          import subprocess, json
+          source = "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4"
+          result = subprocess.run(
+              ["ffprobe", "-v", "error", "-show_entries",
+               "stream=codec_type,codec_name", "-of", "json", source],
+              check=True, capture_output=True, text=True)
+          streams = json.loads(result.stdout)["streams"]
+          assert any(s["codec_type"] == "video" for s in streams), streams
+          assert any(s["codec_type"] == "audio" for s in streams), streams
+          print("Original source contains video and narration/audio streams.")
+          PY
+
+      - name: Create a new clean H.264/AAC MP4
+        run: |
+          python scripts/prepare_intro_mp4.py \
+            --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
+            --output "build/LBPPSP_ALPHA_INTRO_SOURCE.mp4"
+
+      - name: Validate fresh MP4 and presentation assets
         run: python scripts/validate_assets.py --ffprobe ffprobe
 
-      - name: Build in-game PMF video and synchronized PCM audio
+      - name: Build Sony-layout PSMF video and synchronized PCM audio
         run: |
           python scripts/build_intro_pmf.py \
-            --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
+            --input "build/LBPPSP_ALPHA_INTRO_SOURCE.mp4" \
             --output "build/LBPPSP_ALPHA_INTRO.PMF" \
             --audio-output "build/LBPPSP_ALPHA_INTRO.PCM"
 
       - name: Convert loading screen PNG to PSP texture
         run: |
+          mkdir -p build
           ffmpeg -hide_banner -loglevel error -y \
             -i "LBPPSP_Alpha_LoadingScreen.png" \
             -vf "scale=480:272:flags=lanczos,format=rgba,pad=512:512:0:0:color=black" \
             -frames:v 1 -pix_fmt rgba -f rawvideo "build/LOADING.RGBA"
           test "$(stat -c%s build/LOADING.RGBA)" -eq 1048576
-
 
       - name: Clean PSP build
         run: |
@@ -59,12 +81,13 @@ jobs:
 
       - name: Compile and package EBOOT.PBP
         run: |
+          set -o pipefail
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/workspace" \
             -w /workspace/psp \
             pspdev/pspdev:latest make 2>&1 | tee build/psp-build.log
           if grep -q "could not fixup imports" build/psp-build.log; then
-            echo "PSPSDK import table fixup failed; refusing to package this EBOOT."
+            echo "PSPSDK import-table fixup failed; refusing to package this EBOOT."
             exit 1
           fi
 
@@ -79,34 +102,45 @@ jobs:
           cp build/LBPPSP_ALPHA_INTRO.PCM dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
           cp build/LOADING.RGBA dist/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA
           cat > dist/README.txt <<'EOF2'
-          LBPPSP Alpha - PSP homebrew build
+          LBPPSP Alpha - PSP homebrew prototype build
 
           Copy the PSP folder to the root of the Memory Stick.
           Start the application under Game > Memory Stick.
 
-          On launch: the loading-screen image appears for 3 seconds, then
-          the screen stays black for 2 seconds, then the intro starts automatically.
-          X pauses/resumes the cutscene. O stops playback and opens the menu.
+          Startup sequence:
+          1. Loading image for 3 seconds.
+          2. Black screen for 2 seconds.
+          3. Intro video and soundtrack start automatically.
+          4. The prototype menu appears after playback.
 
+          X pauses/resumes the soundtrack clock. O stops playback.
           Keep INTRO.PMF, INTRO.PCM and LOADING.RGBA beside EBOOT.PBP.
-          INTRO.PMF contains the H.264 video; INTRO.PCM is its synchronized
-          44.1 kHz stereo soundtrack. LOADING.RGBA is the 512x512 PSP texture
-          generated from the repository's loading-screen PNG.
+          PLAYBACK.LOG is written in this folder; a fallback is written to
+          the Memory Stick root if the game-folder log cannot be opened.
 
-          This is still a bootable prototype shell, not the complete original
-          LittleBigPlanet game or its original gameplay systems.
+          This is a bootable homebrew prototype shell, not the original
+          LittleBigPlanet game or its gameplay source code.
           EOF2
           zip -qr LBPPSP_ALPHA_build.zip dist
 
-      - name: Upload PSP build
+      - name: Verify final install archive
+        run: |
+          unzip -t LBPPSP_ALPHA_build.zip
+          test -s dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
+          test -s dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF
+          test -s dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
+          test -s dist/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA
+
+      - name: Upload rebuilt PSP package and clean MP4
         uses: actions/upload-artifact@v4
         with:
-          name: LBPPSP-Alpha-PSP-build
+          name: LBPPSP-Alpha-rebuilt-clean-MP4
           path: |
-            psp/EBOOT.PBP
+            LBPPSP_ALPHA_build.zip
+            build/LBPPSP_ALPHA_INTRO_SOURCE.mp4
             build/LBPPSP_ALPHA_INTRO.PMF
             build/LBPPSP_ALPHA_INTRO.PCM
             build/LOADING.RGBA
-            LBPPSP_ALPHA_build.zip
+            psp/EBOOT.PBP
           if-no-files-found: error
           retention-days: 14
