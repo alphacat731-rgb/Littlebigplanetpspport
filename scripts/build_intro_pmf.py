@@ -404,11 +404,15 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="lbppsp-pmf-verify-") as temp_dir:
         recovered_path = Path(temp_dir) / "recovered.h264"
         recovered_path.write_bytes(recovered)
-        # The PMF must contain exactly the stream that was muxed, with no lost,
-        # duplicated, or altered bytes across PES and 2048-byte pack boundaries.
-        if recovered != raw:
+        # The splitter intentionally canonicalizes every NAL start code to
+        # four-byte Annex-B framing and removes only trailing_zero_8bits.
+        # Compare against that exact elementary stream, which is what the
+        # muxer received, rather than the container-extracted raw framing.
+        expected_mux_input = b"".join(access_unit for access_unit, _ in access_units)
+        if recovered != expected_mux_input:
             raise SystemExit(
-                f"PMF H.264 payload changed during muxing: input={len(raw)} recovered={len(recovered)} bytes"
+                "PMF H.264 payload differs from mux input: "
+                f"expected={len(expected_mux_input)} recovered={len(recovered)} bytes"
             )
         run([args.ffmpeg, "-v", "error", "-xerror", "-f", "h264",
              "-i", str(recovered_path), "-f", "null", "-"])
