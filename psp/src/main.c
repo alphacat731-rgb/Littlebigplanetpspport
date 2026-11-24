@@ -9,6 +9,7 @@
 #include <psputility.h>
 #include <psputility_avmodules.h>
 #include <pspmpeg.h>
+#include <psputils.h>
 #include <malloc.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,24 +19,26 @@ PSP_MODULE_INFO("LBPPSP Alpha", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
 PSP_MAIN_THREAD_STACK_SIZE_KB(64);
 
-#define SCREEN_W 480
-#define SCREEN_H 272
-#define FRAME_WIDTH 512
-#define RING_PACKETS 512
-#define SECTOR_SIZE 2048
-#define DRAW_BYTES (FRAME_WIDTH * SCREEN_H * 4)
-#define DISPLAY_BYTES (FRAME_WIDTH * SCREEN_H * 4)
-#define FRAME_BYTES (FRAME_WIDTH * SCREEN_H * 4)
-#define TEXTURE_BYTES (FRAME_WIDTH * 512 * 4)
+#define W 480
+#define H 272
+#define FBW 512
+#define PACKETS 32
+#define MPEG_MODE 4
+#define DDRTOP_SIZE 0x200000
+#define DDRTOP_ALIGN 0x400000
+#define DDRTOP_AU_OFFSET 0x10000
+#define SECTOR 2048
+/* sceMpegGetAvcAu returns this while the ringbuffer has no complete AU yet. */
+#define LBP_MPEG_ERROR_NOT_COMPLETED 0x80618001u
 #define PCM_SAMPLES 512
 #define PCM_BYTES (PCM_SAMPLES * 2 * sizeof(short))
-
-#define GAME_DIR "ms0:/PSP/GAME/LBPPSP_ALPHA/"
-#define PMF_PATH GAME_DIR "INTRO.PMF"
-#define PCM_PATH GAME_DIR "INTRO.PCM"
-#define LOADING_PATH GAME_DIR "LOADING.RGBA"
-#define LOG_PATH GAME_DIR "PLAYBACK.LOG"
+#define PMF_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF"
+#define PCM_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM"
+#define LOG_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/PLAYBACK.LOG"
 #define ROOT_LOG_PATH "ms0:/PLAYBACK.LOG"
+#define DRAW_BYTES (FBW * H * 4)
+#define DISP_BYTES (FBW * H * 4)
+#define VIDEO_TEXTURE_BYTES (FBW * 512 * 4)
 
 typedef struct {
     SceUID file;
@@ -61,6 +64,38 @@ typedef struct {
     short u, v, x, y, z;
 } VideoVertex;
 
+/* Internal sceMpeg AVC detail structures used by the PSP's YCbCr-to-RGB CSC. */
+typedef struct {
+    SceInt32 unknown0, unknown1, width, height;
+    SceInt32 unknown4, unknown5, unknown6, unknown7, unknown8, unknown9;
+} LbpAvcInfo;
+
+typedef struct {
+    ScePVoid buffer0, buffer1, buffer2, buffer3;
+    ScePVoid buffer4, buffer5, buffer6, buffer7;
+    SceInt32 unknown0, unknown1, unknown2;
+} LbpAvcYuv;
+
+typedef struct {
+    SceInt32 unknown0, unknown1, unknown2, unknown3;
+    LbpAvcInfo *info_buffer;
+    SceInt32 unknown5, unknown6, unknown7, unknown8, unknown9, unknown10;
+    LbpAvcYuv *yuv_buffer;
+    SceInt32 unknown12, unknown13, unknown14, unknown15, unknown16, unknown17;
+    SceInt32 unknown18, unknown19, unknown20, unknown21, unknown22, unknown23;
+} LbpAvcDetail2;
+
+typedef struct {
+    SceInt32 height, width, mode0, mode1;
+    ScePVoid buffer0, buffer1, buffer2, buffer3;
+    ScePVoid buffer4, buffer5, buffer6, buffer7;
+} LbpAvcCsc;
+
+/* Exported by sceMpeg / sceMpegbase, but not declared by the stock PSPSDK headers. */
+extern SceInt32 sceMpegAvcDecodeDetail2(SceMpeg *mpeg, LbpAvcDetail2 **detail);
+extern SceInt32 sceMpegBaseCscAvc(ScePVoid rgb_buffer, SceInt32 unknown,
+                                  SceInt32 buffer_width, LbpAvcCsc *csc);
+
 static unsigned int __attribute__((aligned(16))) gu_list[8192];
 static const char *last_playback_stage = "not started";
 static int last_playback_error = 0;
@@ -77,8 +112,7 @@ static int callback_thread(SceSize args, void *argp)
     SceUID cb;
     (void)args; (void)argp;
     cb = sceKernelCreateCallback("LBPPSP Exit", exit_callback, NULL);
-    if (cb >= 0)
-        sceKernelRegisterExitCallback(cb);
+    if (cb >= 0) sceKernelRegisterExitCallback(cb);
     sceKernelSleepThreadCB();
     return 0;
 }
@@ -87,8 +121,7 @@ static void setup_callbacks(void)
 {
     SceUID th = sceKernelCreateThread("LBPPSP Callback", callback_thread,
                                       0x11, 0xFA0, 0, NULL);
-    if (th >= 0)
-        sceKernelStartThread(th, 0, NULL);
+    if (th >= 0) sceKernelStartThread(th, 0, NULL);
 }
 
 static int playback_log_to(const char *path, const char *message)
@@ -100,6 +133,7 @@ static int playback_log_to(const char *path, const char *message)
     fd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_APPEND, 0777);
     if (fd < 0)
         return fd;
+
     while (written < length) {
         int n = sceIoWrite(fd, message + written, (unsigned int)(length - written));
         if (n <= 0) {
@@ -108,15 +142,18 @@ static int playback_log_to(const char *path, const char *message)
         }
         written += (size_t)n;
     }
+
     if (sceIoWrite(fd, "\n", 1) != 1) {
         sceIoClose(fd);
         return -1;
     }
+
     return sceIoClose(fd);
 }
 
 static void playback_log(const char *message)
 {
+    /* Fall back if opening OR writing the game-folder log fails. */
     if (playback_log_to(LOG_PATH, message) < 0)
         (void)playback_log_to(ROOT_LOG_PATH, message);
 }
@@ -126,18 +163,14 @@ static void set_playback_failure(const char *stage, int error)
     char message[160];
     last_playback_stage = stage;
     last_playback_error = error;
-    snprintf(message, sizeof(message), "ERROR at %s: 0x%08X",
-             stage, (unsigned int)error);
+    snprintf(message, sizeof(message), "ERROR at %s: 0x%08X", stage, (unsigned int)error);
     playback_log(message);
 }
 
 static void draw_menu(int selected)
 {
     int i;
-    const char *items[] = {
-        "Start Prototype", "Play Intro Video", "Credits", "Exit"
-    };
-
+    const char *items[] = { "Start Prototype", "Play Intro Video", "Credits", "Exit" };
     pspDebugScreenClear();
     pspDebugScreenSetXY(3, 2);
     pspDebugScreenSetTextColor(0xFFFFFFFF);
@@ -169,185 +202,138 @@ static void draw_page(const char *title, const char *body)
     pspDebugScreenPrintf("\n\n  Press O to return to the menu.\n");
 }
 
-/* sceMpeg consumes complete 2048-byte sectors from this file callback. */
+/* The Media Engine ringbuffer consumes complete 2048-byte MPEG sectors. */
 static SceInt32 pmf_read_callback(ScePVoid data, SceInt32 packets, ScePVoid param)
 {
-    PmfInput *input = (PmfInput *)param;
-    unsigned int wanted = (unsigned int)packets * SECTOR_SIZE;
-    unsigned int received = 0;
-
-    if (input->read_bytes >= input->total) {
-        input->eof = 1;
+    PmfInput *in = (PmfInput *)param;
+    unsigned int wanted = (unsigned int)packets * SECTOR;
+    unsigned int got = 0;
+    if (in->read_bytes >= in->total) {
+        in->eof = 1;
         return 0;
     }
-    if (wanted > input->total - input->read_bytes)
-        wanted = input->total - input->read_bytes;
-    wanted -= wanted % SECTOR_SIZE;
-
-    while (received < wanted) {
-        int n = sceIoRead(input->file, (unsigned char *)data + received,
-                          wanted - received);
+    if (wanted > in->total - in->read_bytes)
+        wanted = in->total - in->read_bytes;
+    wanted -= wanted % SECTOR;
+    while (got < wanted) {
+        int n = sceIoRead(in->file, (unsigned char *)data + got, wanted - got);
         if (n <= 0) {
-            input->eof = 1;
-            input->read_error = n < 0 ? n : -10;
+            in->eof = 1;
+            in->read_error = n < 0 ? n : -10;
             break;
         }
-        received += (unsigned int)n;
+        got += (unsigned int)n;
     }
-
-    input->read_bytes += received;
-    if (received != wanted || (received % SECTOR_SIZE) != 0) {
-        input->eof = 1;
-        if (input->read_error == 0)
-            input->read_error = -11;
+    in->read_bytes += got;
+    if (got != wanted || (got % SECTOR) != 0) {
+        in->eof = 1;
+        if (in->read_error == 0)
+            in->read_error = -11;
         return -1;
     }
-    return (SceInt32)(received / SECTOR_SIZE);
+    return (SceInt32)(got / SECTOR);
 }
 
 static int pcm_thread(SceSize args, void *argp)
 {
-    PcmOutput *output = (PcmOutput *)argp;
+    PcmOutput *out = (PcmOutput *)argp;
     (void)args;
-
-    while (output->running) {
+    while (out->running) {
         int n;
-        if (output->paused) {
+        if (out->paused) {
             sceKernelDelayThread(1000);
             continue;
         }
-        n = sceIoRead(output->file, output->buffer, PCM_BYTES);
+        n = sceIoRead(out->file, out->buffer, PCM_BYTES);
         if (n <= 0) {
             if (n < 0)
-                output->error = n;
-            output->done = 1;
+                out->error = n;
+            out->done = 1;
             break;
         }
         if ((unsigned int)n < PCM_BYTES)
-            memset((unsigned char *)output->buffer + n, 0, PCM_BYTES - n);
-
+            memset((unsigned char *)out->buffer + n, 0, PCM_BYTES - n);
         {
-            int ret = sceAudioOutputBlocking(output->channel,
-                                             PSP_AUDIO_VOLUME_MAX,
-                                             output->buffer);
-            if (ret < 0) {
-                output->error = ret;
-                output->done = 1;
+            int output_result = sceAudioOutputBlocking(out->channel,
+                                                       PSP_AUDIO_VOLUME_MAX,
+                                                       out->buffer);
+            if (output_result < 0) {
+                out->error = output_result;
+                out->done = 1;
                 break;
             }
         }
-        output->samples_played += (unsigned int)(n / 4);
+        out->samples_played += (unsigned int)(n / 4);
         if ((unsigned int)n < PCM_BYTES) {
-            output->done = 1;
+            out->done = 1;
             break;
         }
     }
     return 0;
 }
 
-static int pcm_start(PcmOutput *output)
+static int pcm_start(PcmOutput *out)
 {
-    int ret;
-    memset(output, 0, sizeof(*output));
-    output->file = -1;
-    output->thread = -1;
-    output->channel = -1;
-
-    output->file = sceIoOpen(PCM_PATH, PSP_O_RDONLY, 0);
-    if (output->file < 0)
-        return -1;
-    output->channel = sceAudioChReserve(-1, PCM_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
-    if (output->channel < 0)
-        return -2;
-    output->buffer = memalign(64, PCM_BYTES);
-    if (!output->buffer)
-        return -3;
-
-    output->running = 1;
-    output->thread = sceKernelCreateThread("LBPPSP PCM", pcm_thread, 0x18,
-                                           0x4000, PSP_THREAD_ATTR_USER, NULL);
-    if (output->thread < 0) {
-        output->running = 0;
-        return -4;
-    }
-    ret = sceKernelStartThread(output->thread, sizeof(*output), output);
-    if (ret < 0) {
-        output->running = 0;
-        return -5;
-    }
+    memset(out, 0, sizeof(*out));
+    out->file = sceIoOpen(PCM_PATH, PSP_O_RDONLY, 0);
+    out->thread = -1;
+    out->channel = -1;
+    if (out->file < 0) return -1;
+    out->channel = sceAudioChReserve(-1, PCM_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
+    if (out->channel < 0) return -2;
+    out->buffer = memalign(64, PCM_BYTES);
+    if (!out->buffer) return -3;
+    out->running = 1;
+    out->thread = sceKernelCreateThread("LBPPSP PCM", pcm_thread, 0x18,
+                                        0x4000, PSP_THREAD_ATTR_USER, NULL);
+    if (out->thread < 0) return -4;
+    if (sceKernelStartThread(out->thread, sizeof(*out), out) < 0) return -5;
     return 0;
 }
 
-static void pcm_stop(PcmOutput *output)
+static void pcm_stop(PcmOutput *out)
 {
     char message[128];
-    output->running = 0;
-    if (output->thread >= 0) {
-        sceKernelTerminateDeleteThread(output->thread);
-        output->thread = -1;
+    out->running = 0;
+    if (out->thread >= 0) {
+        sceKernelTerminateDeleteThread(out->thread);
+        out->thread = -1;
     }
-    if (output->error < 0) {
+    if (out->error < 0) {
         snprintf(message, sizeof(message), "PCM playback failed: 0x%08X",
-                 (unsigned int)output->error);
+                 (unsigned int)out->error);
         playback_log(message);
     }
-    if (output->channel >= 0) {
-        sceAudioChRelease(output->channel);
-        output->channel = -1;
+    if (out->channel >= 0) {
+        sceAudioChRelease(out->channel);
+        out->channel = -1;
     }
-    if (output->file >= 0) {
-        sceIoClose(output->file);
-        output->file = -1;
+    if (out->file >= 0) {
+        sceIoClose(out->file);
+        out->file = -1;
     }
-    if (output->buffer) {
-        free(output->buffer);
-        output->buffer = NULL;
+    if (out->buffer) {
+        free(out->buffer);
+        out->buffer = NULL;
     }
-}
-
-/* Audio is decoded ahead on its own thread; keep each video frame near its PTS. */
-static int wait_audio(PcmOutput *audio, unsigned int pts,
-                       unsigned int *previous_buttons)
-{
-    unsigned int target;
-    if (pts == 0xFFFFFFFFu || pts <= 90000u)
-        return 0;
-
-    target = (unsigned int)(((unsigned long long)(pts - 90000u) * 44100u) / 90000u);
-    while (audio->running && !audio->done &&
-           audio->samples_played < target) {
-        SceCtrlData pad;
-        unsigned int pressed;
-        sceCtrlReadBufferPositive(&pad, 1);
-        pressed = pad.Buttons & ~(*previous_buttons);
-        *previous_buttons = pad.Buttons;
-        if (pressed & PSP_CTRL_CIRCLE)
-            return -1;
-        if (pressed & PSP_CTRL_CROSS)
-            audio->paused = !audio->paused;
-        sceKernelDelayThread(1000);
-    }
-    return 0;
 }
 
 static void gu_video_init(void)
 {
     sceGuInit();
     sceGuStart(GU_DIRECT, gu_list);
-    sceGuDrawBuffer(GU_PSM_8888, (void *)0, FRAME_WIDTH);
-    sceGuDispBuffer(SCREEN_W, SCREEN_H, (void *)DISPLAY_BYTES, FRAME_WIDTH);
-    sceGuOffset(2048 - SCREEN_W / 2, 2048 - SCREEN_H / 2);
-    sceGuViewport(2048, 2048, SCREEN_W, SCREEN_H);
-    sceGuScissor(0, 0, SCREEN_W, SCREEN_H);
+    sceGuDrawBuffer(GU_PSM_8888, (void *)0, FBW);
+    sceGuDispBuffer(W, H, (void *)DISP_BYTES, FBW);
+    sceGuOffset(2048 - W / 2, 2048 - H / 2);
+    sceGuViewport(2048, 2048, W, H);
+    sceGuScissor(0, 0, W, H);
     sceGuEnable(GU_SCISSOR_TEST);
     sceGuDisable(GU_DEPTH_TEST);
     sceGuDisable(GU_BLEND);
     sceGuTexMode(GU_PSM_8888, 0, 0, GU_FALSE);
-    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGB);
+    sceGuTexFunc(GU_TFX_REPLACE, GU_TCC_RGBA);
     sceGuTexFilter(GU_LINEAR, GU_LINEAR);
-    sceGuTexWrap(GU_CLAMP, GU_CLAMP);
     sceGuEnable(GU_TEXTURE_2D);
-    sceGuColor(0xFFFFFFFF);
     sceGuClearColor(0xFF000000);
     sceGuClear(GU_COLOR_BUFFER_BIT);
     sceGuFinish();
@@ -357,28 +343,19 @@ static void gu_video_init(void)
     sceGuDisplay(GU_TRUE);
 }
 
+
 static void gu_video_frame(void *frame)
 {
-    VideoVertex *vertices;
-
+    VideoVertex *v;
     sceGuStart(GU_DIRECT, gu_list);
     sceGuClearColor(0xFF000000);
     sceGuClear(GU_COLOR_BUFFER_BIT);
-    /* The decoder writes 512x272 pixels into the eDRAM frame buffer. */
-    sceGuTexImage(0, 512, 512, FRAME_WIDTH, frame);
-    vertices = (VideoVertex *)sceGuGetMemory(2 * sizeof(VideoVertex));
-    vertices[0].u = 0;
-    vertices[0].v = 0;
-    vertices[0].x = 0;
-    vertices[0].y = 0;
-    vertices[0].z = 0;
-    vertices[1].u = SCREEN_W;
-    vertices[1].v = SCREEN_H;
-    vertices[1].x = SCREEN_W;
-    vertices[1].y = SCREEN_H;
-    vertices[1].z = 0;
+    sceGuTexImage(0, 512, 512, FBW, frame);
+    v = (VideoVertex *)sceGuGetMemory(2 * sizeof(VideoVertex));
+    v[0].u = 0; v[0].v = 0; v[0].x = 0; v[0].y = 0; v[0].z = 0;
+    v[1].u = W; v[1].v = H; v[1].x = W; v[1].y = H; v[1].z = 0;
     sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT |
-                   GU_TRANSFORM_2D, 2, NULL, vertices);
+                   GU_TRANSFORM_2D, 2, NULL, v);
     sceGuFinish();
     sceGuSync(0, 0);
     sceDisplayWaitVblankStart();
@@ -392,7 +369,7 @@ static void show_startup_splash(void)
     unsigned int loaded = 0;
     const unsigned int image_size = 512 * 512 * 4;
 
-    file = sceIoOpen(LOADING_PATH, PSP_O_RDONLY, 0);
+    file = sceIoOpen("ms0:/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA", PSP_O_RDONLY, 0);
     if (file < 0)
         goto black_fallback;
 
@@ -401,6 +378,7 @@ static void show_startup_splash(void)
         sceIoClose(file);
         goto black_fallback;
     }
+
     while (loaded < image_size) {
         int n = sceIoRead(file, (unsigned char *)image + loaded, image_size - loaded);
         if (n <= 0)
@@ -415,24 +393,10 @@ static void show_startup_splash(void)
     }
 
     gu_video_init();
-    sceGuStart(GU_DIRECT, gu_list);
-    sceGuClearColor(0xFF000000);
-    sceGuClear(GU_COLOR_BUFFER_BIT);
-    sceGuTexImage(0, 512, 512, 512, image);
-    {
-        VideoVertex *v = (VideoVertex *)sceGuGetMemory(2 * sizeof(VideoVertex));
-        v[0].u = 0; v[0].v = 0; v[0].x = 0; v[0].y = 0; v[0].z = 0;
-        v[1].u = SCREEN_W; v[1].v = SCREEN_H;
-        v[1].x = SCREEN_W; v[1].y = SCREEN_H; v[1].z = 0;
-        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT |
-                       GU_TRANSFORM_2D, 2, NULL, v);
-    }
-    sceGuFinish();
-    sceGuSync(0, 0);
-    sceDisplayWaitVblankStart();
-    sceGuSwapBuffers();
+    gu_video_frame(image);
     sceKernelDelayThread(3 * 1000 * 1000);
 
+    /* Hold a clean black frame for two seconds before the intro starts. */
     sceGuStart(GU_DIRECT, gu_list);
     sceGuClearColor(0xFF000000);
     sceGuClear(GU_COLOR_BUFFER_BIT);
@@ -448,58 +412,55 @@ static void show_startup_splash(void)
     return;
 
 black_fallback:
+    /* Missing splash asset should not prevent the actual intro from playing. */
     pspDebugScreenInit();
     sceKernelDelayThread(2 * 1000 * 1000);
 }
 
-/*
- * This follows the normal PSP sceMpeg decode path:
- *  - 512-packet ringbuffer and mode 0 decoder allocation
- *  - SDK-allocated AVC elementary-stream buffer
- *  - decoded 8888 frame buffer in eDRAM after the GU draw/display buffers
- *  - sceMpegAvcDecode receives the frame pointer by double indirection
- *
- * The previous build's private AVC/YUV structures and hand-written CSC path
- * are intentionally removed. They were not necessary and were a likely
- * source of real-hardware failure.
- */
+static int wait_audio(PcmOutput *audio, unsigned int pts)
+{
+    unsigned int target;
+    if (pts == 0xFFFFFFFFu || pts <= 90000u) return 0;
+    target = (unsigned int)(((unsigned long long)(pts - 90000u) * 44100u) / 90000u);
+    while (audio->running && !audio->done && audio->samples_played < target) {
+        SceCtrlData pad;
+        sceCtrlPeekBufferPositive(&pad, 1);
+        if (pad.Buttons & PSP_CTRL_CIRCLE) return -1;
+        sceKernelDelayThread(1000);
+    }
+    return 0;
+}
+
 static int play_intro(void)
 {
-    int result = -1;
-    int avcodec_loaded = 0;
-    int mpegbase_loaded = 0;
-    int mpeg_initialized = 0;
-    int ring_ready = 0;
-    int mpeg_ready = 0;
-    int stream_ready = 0;
-    int gu_ready = 0;
-    int audio_started = 0;
-    int frames = 0;
-    SceInt32 decode_status = 0;
-    SceInt32 unknown = 0;
-    int ring_size;
-    int mpeg_size;
-    int idle_polls = 0;
-    unsigned int previous_buttons = 0;
+    int result = -1, avcodec = 0, mpegbase = 0, mpeginit = 0;
+    int rb_ready = 0, mpeg_ready = 0, stream_ready = 0, gu_ready = 0;
     SceUID file = -1;
     unsigned char header[0x800];
     SceMpeg mpeg = NULL;
     SceMpegRingbuffer ring;
     SceMpegStream *stream = NULL;
-    SceMpegAu au;
+    SceMpegAu *au = NULL;
     SceMpegAvcMode mode;
     PmfInput input;
     PcmOutput audio;
-    void *ring_memory = NULL;
-    void *mpeg_memory = NULL;
-    void *es_buffer = NULL;
-    void *frame = NULL;
-    unsigned long long first_frame_deadline;
-    char logbuf[160];
+    void *rb_mem = NULL, *mpeg_mem = NULL, *ddrtop = NULL;
+    void *au_es = NULL, *au_mem = NULL, *frame = NULL, *frame_uncached = NULL;
+    void *decode_buffer = NULL;
+    LbpAvcDetail2 *detail2 = NULL;
+    LbpAvcCsc csc;
+    int rb_size, mpeg_size;
+    SceInt32 offset = 0, stream_size = 0, unknown = 0, pic_num = 0;
+    unsigned int previous = 0;
+    int audio_started = 0, frames = 0;
+    int decode_calls = 0, zero_pic_calls = 0, au_wait_polls = 0;
+    int first_au_logged = 0, first_decode_logged = 0, first_csc_logged = 0;
+    unsigned long long first_frame_wait_start = 0;
+    char logbuf[128];
 
     last_playback_stage = "Opening INTRO.PMF";
     last_playback_error = 0;
-    playback_log("=== fresh sceMpeg player begin ===");
+    playback_log("=== play_intro begin ===");
     memset(&input, 0, sizeof(input));
     memset(&audio, 0, sizeof(audio));
     input.file = -1;
@@ -508,330 +469,410 @@ static int play_intro(void)
     audio.channel = -1;
 
     file = sceIoOpen(PMF_PATH, PSP_O_RDONLY, 0);
-    if (file < 0) {
-        set_playback_failure("Opening INTRO.PMF", file);
-        goto cleanup;
+    if (file < 0) { set_playback_failure("Opening INTRO.PMF", file); goto cleanup; }
+    playback_log("PMF opened");
+    last_playback_stage = "Reading PMF header";
+    { int n = sceIoRead(file, header, sizeof(header));
+      if (n != (int)sizeof(header)) { set_playback_failure("Reading PMF header", n); goto cleanup; }
     }
-    if (sceIoRead(file, header, sizeof(header)) != (int)sizeof(header)) {
-        set_playback_failure("Reading PSMF header", -1);
-        goto cleanup;
-    }
-    if (memcmp(header, "PSMF0014", 8) != 0) {
-        set_playback_failure("Checking PSMF0014 magic", -2);
-        goto cleanup;
-    }
-    playback_log("PSMF header read");
+    if (memcmp(header, "PSMF0014", 8) != 0) { set_playback_failure("Checking PSMF magic", -2); goto cleanup; }
+    playback_log("PSMF header valid");
 
-    last_playback_stage = "Loading AVCODEC";
-    {
-        int ret = sceUtilityLoadAvModule(PSP_AV_MODULE_AVCODEC);
-        if (ret < 0) {
-            set_playback_failure("Loading AVCODEC", ret);
-            goto cleanup;
-        }
+    last_playback_stage = "Loading AVCODEC module";
+    { int ret = sceUtilityLoadAvModule(PSP_AV_MODULE_AVCODEC);
+      if (ret < 0) { set_playback_failure("Loading AVCODEC module", ret); goto cleanup; }
     }
-    avcodec_loaded = 1;
-
-    last_playback_stage = "Loading MPEGBASE";
-    {
-        int ret = sceUtilityLoadAvModule(PSP_AV_MODULE_MPEGBASE);
-        if (ret < 0) {
-            set_playback_failure("Loading MPEGBASE", ret);
-            goto cleanup;
-        }
+    avcodec = 1;
+    playback_log("AVCODEC module loaded");
+    last_playback_stage = "Loading MPEGBASE module";
+    { int ret = sceUtilityLoadAvModule(PSP_AV_MODULE_MPEGBASE);
+      if (ret < 0) { set_playback_failure("Loading MPEGBASE module", ret); goto cleanup; }
     }
-    mpegbase_loaded = 1;
-
+    playback_log("MPEGBASE module loaded");
+    mpegbase = 1;
     last_playback_stage = "Initializing sceMpeg";
-    {
-        int ret = sceMpegInit();
-        if (ret < 0) {
-            set_playback_failure("Initializing sceMpeg", ret);
-            goto cleanup;
-        }
+    { int ret = sceMpegInit();
+      if (ret < 0) { set_playback_failure("Initializing sceMpeg", ret); goto cleanup; }
     }
-    mpeg_initialized = 1;
+    mpeginit = 1;
     playback_log("sceMpegInit succeeded");
 
-    /* Mode 0 is the standard sceMpeg player path used by PSPRelay. */
-    ring_size = sceMpegRingbufferQueryMemSize(RING_PACKETS);
-    mpeg_size = sceMpegQueryMemSize(0);
-    if (ring_size <= 0 || mpeg_size <= 0) {
-        set_playback_failure("Querying MPEG memory sizes",
-                             ring_size <= 0 ? ring_size : mpeg_size);
-        goto cleanup;
-    }
-    ring_memory = memalign(64, ring_size);
-    mpeg_memory = memalign(64, mpeg_size);
-    if (!ring_memory || !mpeg_memory) {
-        set_playback_failure("Allocating MPEG memory", -3);
-        goto cleanup;
-    }
+    rb_size = sceMpegRingbufferQueryMemSize(PACKETS);
+    /* 480x272 is the PSP low-resolution AVC path (mode 4). */
+    mpeg_size = sceMpegQueryMemSize(MPEG_MODE);
+    last_playback_stage = "Querying MPEG memory sizes";
+    if (rb_size <= 0 || mpeg_size <= 0) { set_playback_failure("Querying MPEG memory sizes", rb_size <= 0 ? rb_size : mpeg_size); goto cleanup; }
+    rb_mem = memalign(64, rb_size);
+    mpeg_mem = memalign(64, mpeg_size);
+    /* sceMpegCreate requires a 4 MiB-aligned, 2 MiB Media Engine workspace. */
+    ddrtop = memalign(DDRTOP_ALIGN, DDRTOP_SIZE);
+    /* The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels. */
+    au_mem = memalign(64, 64);
+    last_playback_stage = "Allocating MPEG memory";
+    if (!rb_mem || !mpeg_mem || !ddrtop || !au_mem) { set_playback_failure("Allocating MPEG memory", -3); goto cleanup; }
+    memset(au_mem, 0xFF, 64);
+    au = (SceMpegAu *)au_mem;
+    au_es = (unsigned char *)ddrtop + DDRTOP_AU_OFFSET;
 
     input.file = file;
     last_playback_stage = "Constructing MPEG ringbuffer";
-    {
-        int ret = sceMpegRingbufferConstruct(&ring, RING_PACKETS,
-                                             ring_memory, ring_size,
-                                             pmf_read_callback, &input);
-        if (ret < 0) {
-            set_playback_failure("Constructing MPEG ringbuffer", ret);
-            goto cleanup;
-        }
+    { int ret = sceMpegRingbufferConstruct(&ring, PACKETS, rb_mem, rb_size,
+                                           pmf_read_callback, &input);
+      if (ret < 0) { set_playback_failure("Constructing MPEG ringbuffer", ret); goto cleanup; }
     }
-    ring_ready = 1;
-    playback_log("512-packet MPEG ringbuffer constructed");
-
-    last_playback_stage = "Creating mode-0 MPEG decoder";
-    {
-        int ret = sceMpegCreate(&mpeg, mpeg_memory, mpeg_size, &ring,
-                                FRAME_WIDTH, 0, 0);
-        if (ret < 0) {
-            set_playback_failure("Creating mode-0 MPEG decoder", ret);
-            goto cleanup;
-        }
+    rb_ready = 1;
+    playback_log("MPEG ringbuffer constructed");
+    last_playback_stage = "Creating MPEG decoder";
+    { int ret = sceMpegCreate(&mpeg, mpeg_mem, mpeg_size, &ring, FBW,
+                              MPEG_MODE, (SceInt32)ddrtop);
+      if (ret < 0) { set_playback_failure("Creating MPEG decoder", ret); goto cleanup; }
     }
+    playback_log("sceMpegCreate succeeded");
     mpeg_ready = 1;
-    playback_log("mode-0 sceMpeg decoder created");
 
     mode.iUnk0 = -1;
     mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
-    last_playback_stage = "Setting AVC decode mode";
-    {
-        int ret = sceMpegAvcDecodeMode(&mpeg, &mode);
-        if (ret < 0) {
-            set_playback_failure("Setting AVC decode mode", ret);
-            goto cleanup;
-        }
+    last_playback_stage = "Reading PMF stream metadata";
+    { int ret = sceMpegQueryStreamOffset(&mpeg, header, &offset);
+      if (ret < 0) { set_playback_failure("Reading PMF stream offset", ret); goto cleanup; }
     }
-    playback_log("AVC pixel format configured before stream registration");
-
-    last_playback_stage = "Reading PSMF stream offset";
-    {
-        SceInt32 stream_offset = 0;
-        SceInt32 stream_size = 0;
-        int ret = sceMpegQueryStreamOffset(&mpeg, header, &stream_offset);
-        if (ret < 0) {
-            set_playback_failure("Reading PSMF stream offset", ret);
-            goto cleanup;
-        }
-        ret = sceMpegQueryStreamSize(header, &stream_size);
-        if (ret < 0) {
-            set_playback_failure("Reading PSMF stream size", ret);
-            goto cleanup;
-        }
-        if (stream_offset < (int)sizeof(header) || stream_size <= 0 ||
-            (stream_size % SECTOR_SIZE) != 0) {
-            set_playback_failure("Checking PSMF stream bounds", -4);
-            goto cleanup;
-        }
-        if (stream_offset > (int)sizeof(header)) {
-            int skip = stream_offset - (int)sizeof(header);
-            unsigned char scratch[512];
-            while (skip > 0) {
-                int amount = skip > (int)sizeof(scratch) ? (int)sizeof(scratch) : skip;
-                int n = sceIoRead(file, scratch, amount);
-                if (n <= 0) {
-                    set_playback_failure("Skipping PSMF padding", n < 0 ? n : -5);
-                    goto cleanup;
-                }
-                skip -= n;
+    { int ret = sceMpegQueryStreamSize(header, &stream_size);
+      if (ret < 0) { set_playback_failure("Reading PMF stream size", ret); goto cleanup; }
+    }
+    if (offset < (int)sizeof(header)) {
+        set_playback_failure("Validating PMF stream offset", -9);
+        goto cleanup;
+    }
+    if (stream_size <= 0) {
+        set_playback_failure("Validating PMF stream size", -10);
+        goto cleanup;
+    }
+    if ((stream_size % SECTOR) != 0) {
+        set_playback_failure("Validating PMF sector alignment", -11);
+        goto cleanup;
+    }
+    if (offset > (int)sizeof(header)) {
+        int skip = offset - (int)sizeof(header);
+        unsigned char scratch[512];
+        while (skip > 0) {
+            int n = sceIoRead(file, scratch, skip > (int)sizeof(scratch) ? (int)sizeof(scratch) : skip);
+            if (n <= 0) {
+                set_playback_failure("Skipping PMF stream padding", n < 0 ? n : -12);
+                goto cleanup;
             }
+            skip -= n;
         }
-        input.total = (unsigned int)stream_size;
     }
-
+    input.total = (unsigned int)stream_size;
     last_playback_stage = "Registering AVC stream";
     stream = sceMpegRegistStream(&mpeg, 0, 0);
-    if (!stream) {
-        set_playback_failure("Registering AVC stream", -6);
-        goto cleanup;
-    }
+    if (!stream) { set_playback_failure("Registering AVC stream", -4); goto cleanup; }
     stream_ready = 1;
     playback_log("AVC stream registered");
-
-    last_playback_stage = "Allocating AVC ES buffer";
-    es_buffer = sceMpegMallocAvcEsBuf(&mpeg);
-    if (!es_buffer) {
-        set_playback_failure("Allocating AVC ES buffer", -7);
-        goto cleanup;
+    last_playback_stage = "Initializing AVC access-unit buffer";
+    { int ret = sceMpegInitAu(&mpeg, au_es, au);
+      if (ret < 0) { set_playback_failure("Initializing AVC access-unit buffer", ret); goto cleanup; }
     }
-    playback_log("SDK AVC ES buffer allocated");
-    memset(&au, 0xFF, sizeof(au));
-    last_playback_stage = "Initializing AVC access unit";
-    {
-        int ret = sceMpegInitAu(&mpeg, es_buffer, &au);
-        if (ret < 0) {
-            set_playback_failure("Initializing AVC access unit", ret);
-            goto cleanup;
-        }
+    last_playback_stage = "Setting AVC decode mode";
+    { int ret = sceMpegAvcDecodeMode(&mpeg, &mode);
+      if (ret < 0) { set_playback_failure("Setting AVC decode mode", ret); goto cleanup; }
     }
+    playback_log("AVC decode mode configured");
 
     /*
-     * PSP Media Engine frame output belongs in eDRAM. The GU draw/display
-     * buffers occupy the first two 512x272 surfaces; the AVC frame follows.
+     * Keep the converted RGBA texture in main RAM. A 512x512 texture is
+     * required by the GU, even though the visible video is only 480x272.
      */
-    frame = (unsigned char *)sceGeEdramGetAddr() + DRAW_BYTES + DISPLAY_BYTES;
-    if (!frame) {
-        set_playback_failure("Locating eDRAM frame buffer", -8);
+    frame = memalign(64, VIDEO_TEXTURE_BYTES);
+    decode_buffer = memalign(64, VIDEO_TEXTURE_BYTES);
+    last_playback_stage = "Allocating video frame buffers";
+    if (!frame || !decode_buffer) {
+        set_playback_failure("Allocating video frame buffers", -5);
         goto cleanup;
     }
+    memset(frame, 0, VIDEO_TEXTURE_BYTES);
+    memset(decode_buffer, 0, VIDEO_TEXTURE_BYTES);
+    frame_uncached = (void *)(((unsigned int)frame) | 0x40000000u);
     gu_video_init();
     gu_ready = 1;
+    playback_log("GU initialized; entering playback loop");
 
+    /* Start PCM independently of the first video frame. A decoder failure must
+       not suppress the soundtrack or leave the user with a silent splash. */
     {
-        int ret = pcm_start(&audio);
-        if (ret == 0) {
+        int pcm_result = pcm_start(&audio);
+        if (pcm_result == 0) {
             audio_started = 1;
-            playback_log("Fresh AAC-derived PCM soundtrack started");
+            playback_log("PCM audio thread started");
         } else {
             snprintf(logbuf, sizeof(logbuf),
-                     "WARNING: PCM sidecar could not start: %d", ret);
+                     "WARNING: PCM audio startup failed: %d", pcm_result);
             playback_log(logbuf);
         }
     }
-
-    playback_log("Entering mode-0 AVC decode loop");
-    first_frame_deadline = (unsigned long long)sceKernelGetSystemTimeWide() + 10000000ULL;
+    first_frame_wait_start = (unsigned long long)sceKernelGetSystemTimeWide();
 
     for (;;) {
         SceCtrlData pad;
         unsigned int pressed;
-        int available;
-        int got;
+        int available, got;
 
         sceCtrlReadBufferPositive(&pad, 1);
-        pressed = pad.Buttons & ~previous_buttons;
-        previous_buttons = pad.Buttons;
-        if (pressed & PSP_CTRL_CIRCLE) {
-            result = 1;
-            break;
-        }
-        if (pressed & PSP_CTRL_CROSS)
-            audio.paused = !audio.paused;
+        pressed = pad.Buttons & ~previous;
+        previous = pad.Buttons;
+        if (pressed & PSP_CTRL_CIRCLE) { result = 1; break; }
+        if (pressed & PSP_CTRL_CROSS) audio.paused = !audio.paused;
+        if (audio.paused) { sceKernelDelayThread(1000); continue; }
 
         available = sceMpegRingbufferAvailableSize(&ring);
         if (available < 0) {
-            set_playback_failure("Checking ringbuffer space", available);
+            set_playback_failure("Querying MPEG ringbuffer availability", available);
             goto cleanup;
         }
         if (available > 0) {
             int count = available > 32 ? 32 : available;
-            int put = sceMpegRingbufferPut(&ring, count, available);
-            if (input.read_error < 0) {
-                set_playback_failure("Reading PMF data", input.read_error);
-                goto cleanup;
-            }
-            if (put < 0) {
-                set_playback_failure("Filling MPEG ringbuffer", put);
-                goto cleanup;
+            last_playback_stage = "Filling MPEG ringbuffer";
+            { int ret = sceMpegRingbufferPut(&ring, count, available);
+              if (input.read_error < 0) {
+                  set_playback_failure("Reading PMF ringbuffer data", input.read_error);
+                  goto cleanup;
+              }
+              if (ret < 0) {
+                  set_playback_failure("Filling MPEG ringbuffer", ret);
+                  goto cleanup;
+              }
             }
         }
-
-        last_playback_stage = "Reading AVC access unit";
-        got = sceMpegGetAvcAu(&mpeg, stream, &au, &unknown);
-        if (got == 0) {
+        last_playback_stage = "Reading next AVC access unit";
+        got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
+        /*
+         * 0x80618001 is the normal "not completed/no data yet" result while
+         * sceMpeg's ringbuffer is being filled. It is retryable, not a decoder
+         * failure. PPSSPP returns it before its asynchronous ringbuffer callback
+         * has supplied the first complete access unit.
+         */
+        if (got < 0 && (SceUInt32)got != LBP_MPEG_ERROR_NOT_COMPLETED) {
+            set_playback_failure("Reading AVC access unit", got);
+            goto cleanup;
+        }
+        if (got != 0) {
+            ++au_wait_polls;
+            if (au_wait_polls == 1 || (au_wait_polls % 120) == 0) {
+                snprintf(logbuf, sizeof(logbuf),
+                         "AVC AU pending: ret=%d polls=%d input=%u/%u frames=%d",
+                         got, au_wait_polls, input.read_bytes, input.total, frames);
+                playback_log(logbuf);
+            }
+        } else {
+            if (au_wait_polls > 0) {
+                snprintf(logbuf, sizeof(logbuf),
+                         "AVC AU resumed after %d pending polls", au_wait_polls);
+                playback_log(logbuf);
+            }
+            au_wait_polls = 0;
             int decoded;
-            last_playback_stage = "Decoding AVC frame";
+            int direct_output_fallback = 0;
+            if (!first_au_logged) {
+                playback_log("First AVC access unit acquired");
+                first_au_logged = 1;
+            }
+
             /*
-             * The PSP decoder expects an address of a frame-pointer variable.
-             * decode_status is persistent state: it starts at zero and the
-             * decoder sets it to one when a displayable frame is ready.
+             * The established PSP/PMPlayer path passes NULL here and obtains
+             * the Media Engine's YCbCr planes through sceMpegAvcDecodeDetail2.
+             * PPSSPP's current HLE instead requires pBuffer to point to a PSP
+             * pointer variable and returns -1 for NULL. Try the real-hardware
+             * ABI first, then use the HLE-only direct-ABGR fallback on that
+             * exact invalid-address result.
              */
-            decoded = sceMpegAvcDecode(&mpeg, &au, FRAME_WIDTH, &frame,
-                                       &decode_status);
+            sceKernelDcacheWritebackInvalidateAll();
+            if (!first_decode_logged)
+                playback_log("Entering sceMpegAvcDecode");
+            last_playback_stage = "Decoding first AVC frame";
+            /*
+             * iInit is persistent decoder state, not a per-frame counter:
+             * PSPSDK documents 0 on the first call and 1 thereafter. Keep
+             * the value written by the decoder across access units.
+             */
+            {
+                int init_before = pic_num;
+                decoded = sceMpegAvcDecode(&mpeg, au, FBW, NULL, &pic_num);
+                if (decoded == -1) {
+                    void *decode_output = decode_buffer;
+                    void *decode_output_arg = &decode_output;
+                    decoded = sceMpegAvcDecode(&mpeg, au, FBW,
+                                                decode_output_arg, &pic_num);
+                    if (decoded == 0) {
+                        direct_output_fallback = 1;
+                        playback_log("Using PPSSPP direct-ABGR decode fallback");
+                    }
+                }
+                ++decode_calls;
+                if (decode_calls == 1 || (decode_calls % 30) == 0) {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "AVC decode #%d: ret=%d iInit=%d->%d pts=%u input=%u/%u",
+                             decode_calls, decoded, init_before, (int)pic_num,
+                             (unsigned int)au->iPts, input.read_bytes, input.total);
+                    playback_log(logbuf);
+                }
+            }
+            if (!first_decode_logged)
+                first_decode_logged = 1;
             if (decoded != 0) {
                 set_playback_failure("Decoding AVC frame", decoded);
                 goto cleanup;
             }
-            if (decode_status == 1) {
-                if (audio_started && wait_audio(&audio, (unsigned int)au.iPts, &previous_buttons) < 0) {
-                    result = 1;
-                    break;
-                }
-                gu_video_frame(frame);
-                ++frames;
-                idle_polls = 0;
-                if (frames == 1 || (frames % 30) == 0) {
+
+            if (pic_num <= 0) {
+                ++zero_pic_calls;
+                if (zero_pic_calls == 1 || (zero_pic_calls % 30) == 0) {
                     snprintf(logbuf, sizeof(logbuf),
-                             "Rendered frame %d; PTS=%u; stream=%u/%u",
-                             frames, (unsigned int)au.iPts,
-                             input.read_bytes, input.total);
+                             "AVC decode produced no frame: calls=%d no_frame=%d pts=%u",
+                             decode_calls, zero_pic_calls, (unsigned int)au->iPts);
                     playback_log(logbuf);
                 }
-            } else {
-                ++idle_polls;
             }
-        } else {
-            ++idle_polls;
-            if (input.read_error < 0) {
-                set_playback_failure("Reading PMF ringbuffer data", input.read_error);
-                goto cleanup;
+            if (pic_num > 0) {
+                unsigned int x, y;
+                unsigned int *pixels;
+                if (direct_output_fallback) {
+                    /* The direct-output HLE path was selected above. */
+                    sceKernelDcacheInvalidateRange(decode_buffer,
+                                                   VIDEO_TEXTURE_BYTES);
+                    memcpy(frame, decode_buffer, VIDEO_TEXTURE_BYTES);
+                    last_playback_stage = "Preparing direct decoded frame";
+                } else {
+                    LbpAvcInfo *info;
+                    LbpAvcYuv *yuv;
+                    SceInt32 csc_result;
+
+                    detail2 = NULL;
+                    last_playback_stage = "Reading decoded-frame details";
+                    {
+                        int detail_result =
+                            sceMpegAvcDecodeDetail2(&mpeg, &detail2);
+                        if (detail_result != 0 || !detail2 ||
+                            !detail2->info_buffer || !detail2->yuv_buffer) {
+                            set_playback_failure("Reading decoded-frame details",
+                                                 detail_result != 0 ? detail_result : -6);
+                            goto cleanup;
+                        }
+                    }
+
+                    info = detail2->info_buffer;
+                    yuv = detail2->yuv_buffer;
+                    memset(&csc, 0, sizeof(csc));
+                    csc.width = (info->width + 15) >> 4;
+                    csc.height = (info->height + 15) >> 4;
+                    csc.mode0 = 0;
+                    csc.mode1 = 0;
+                    csc.buffer0 = yuv->buffer0;
+                    csc.buffer1 = yuv->buffer1;
+                    csc.buffer2 = yuv->buffer2;
+                    csc.buffer3 = yuv->buffer3;
+                    csc.buffer4 = yuv->buffer4;
+                    csc.buffer5 = yuv->buffer5;
+                    csc.buffer6 = yuv->buffer6;
+                    csc.buffer7 = yuv->buffer7;
+
+                    if (csc.width <= 0 || csc.height <= 0 ||
+                        csc.width > 32 || csc.height > 32) {
+                        set_playback_failure("Checking decoded-frame dimensions", -7);
+                        goto cleanup;
+                    }
+
+                    sceKernelDcacheWritebackInvalidateAll();
+                    last_playback_stage = "Converting decoded frame to RGB";
+                    if (!first_csc_logged)
+                        playback_log("Entering sceMpegBaseCscAvc");
+                    csc_result = sceMpegBaseCscAvc(frame_uncached, 0, FBW, &csc);
+                    if (csc_result != 0) {
+                        set_playback_failure("Converting decoded frame to RGB", csc_result);
+                        goto cleanup;
+                    }
+                    sceKernelDcacheInvalidateRange(frame, VIDEO_TEXTURE_BYTES);
+                    if (!first_csc_logged) {
+                        playback_log("First CSC conversion succeeded");
+                        first_csc_logged = 1;
+                    }
+                }
+
+                /* The PSP CSC path may leave alpha clear; force opaque pixels. */
+                pixels = (unsigned int *)frame;
+                for (y = 0; y < H; ++y) {
+                    for (x = 0; x < W; ++x)
+                        pixels[y * FBW + x] |= 0xFF000000u;
+                }
+                sceKernelDcacheWritebackInvalidateRange(frame,
+                                                        VIDEO_TEXTURE_BYTES);
+
+                if (frames == 0) {
+                    unsigned int nonblack = 0;
+                    unsigned int checksum = 2166136261u;
+                    for (y = 0; y < H; ++y) {
+                        for (x = 0; x < W; ++x) {
+                            unsigned int pixel = pixels[y * FBW + x];
+                            checksum = (checksum ^ pixel) * 16777619u;
+                            if ((pixel & 0x00FFFFFFu) != 0)
+                                ++nonblack;
+                        }
+                    }
+                    snprintf(logbuf, sizeof(logbuf),
+                             "First frame pixels: hash=%08X nonblack=%u/%u p0=%08X pc=%08X",
+                             checksum, nonblack, (unsigned int)(W * H),
+                             pixels[0], pixels[(H / 2) * FBW + (W / 2)]);
+                    playback_log(logbuf);
+                }
+
+                if (audio_started && wait_audio(&audio, au->iPts) < 0) { result = 1; break; }
+                gu_video_frame(frame);
+                ++frames;
+                if (frames == 1 || (frames % 30) == 0) {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "GU frame submitted: frames=%d pts=%u",
+                             frames, (unsigned int)au->iPts);
+                    playback_log(logbuf);
+                }
             }
-            if (input.eof &&
-                sceMpegRingbufferAvailableSize(&ring) >= RING_PACKETS) {
+        }
+        if (got != 0) {
+            if (input.eof && sceMpegRingbufferAvailableSize(&ring) >= PACKETS)
                 break;
-            }
             sceKernelDelayThread(1000);
         }
-
         if (frames == 0 &&
-            (unsigned long long)sceKernelGetSystemTimeWide() > first_frame_deadline) {
-            set_playback_failure("Waiting for the first decoded frame (10s timeout)", -9);
-            goto cleanup;
-        }
-        if (idle_polls > 30000 && input.eof) {
-            if (frames > 0)
-                break;
-            set_playback_failure("No AVC frames returned before EOF", -10);
+            ((unsigned long long)sceKernelGetSystemTimeWide() - first_frame_wait_start) > 10000000ULL) {
+            set_playback_failure("Waiting for first decoded video frame (10s timeout)", -8);
             goto cleanup;
         }
     }
-
-    if (frames <= 0 && result != 1) {
-        set_playback_failure("No video frames were rendered", -11);
-        goto cleanup;
-    }
-    if (result == -1)
-        result = 0;
-
-    if (audio_started && result == 0) {
-        /* Let the sidecar finish after the last displayed video frame. */
-        while (audio.running && !audio.done)
-            sceKernelDelayThread(1000);
-    }
+    if (frames > 0 && result == -1) result = 0;
 
 cleanup:
     snprintf(logbuf, sizeof(logbuf),
-             "Playback end: result=%d rendered_frames=%d stream=%u/%u read_error=%d",
-             result, frames, input.read_bytes, input.total, input.read_error);
+             "Playback cleanup: result=%d frames=%d decodes=%d no_frame=%d au_wait=%d input=%u/%u",
+             result, frames, decode_calls, zero_pic_calls, au_wait_polls,
+             input.read_bytes, input.total);
     playback_log(logbuf);
     pcm_stop(&audio);
-
-    if (es_buffer && mpeg_ready)
-        sceMpegFreeAvcEsBuf(&mpeg, es_buffer);
-    if (stream_ready)
-        sceMpegUnRegistStream(mpeg, stream);
-    if (mpeg_ready)
-        sceMpegDelete(&mpeg);
-    if (ring_ready)
-        sceMpegRingbufferDestruct(&ring);
-    if (mpeg_initialized)
-        sceMpegFinish();
     if (gu_ready) {
         sceGuTerm();
         pspDebugScreenInit();
     }
-    if (mpegbase_loaded)
-        sceUtilityUnloadAvModule(PSP_AV_MODULE_MPEGBASE);
-    if (avcodec_loaded)
-        sceUtilityUnloadAvModule(PSP_AV_MODULE_AVCODEC);
-    if (ring_memory)
-        free(ring_memory);
-    if (mpeg_memory)
-        free(mpeg_memory);
-    if (file >= 0)
-        sceIoClose(file);
+    if (stream_ready) sceMpegUnRegistStream(mpeg, stream);
+    if (mpeg_ready) sceMpegDelete(&mpeg);
+    if (rb_ready) sceMpegRingbufferDestruct(&ring);
+    if (mpeginit) sceMpegFinish();
+    /* Keep the AU descriptor alive until sceMpeg has been deleted. */
+    if (au_mem) free(au_mem);
+    if (mpegbase) sceUtilityUnloadAvModule(PSP_AV_MODULE_MPEGBASE);
+    if (avcodec) sceUtilityUnloadAvModule(PSP_AV_MODULE_AVCODEC);
+    if (rb_mem) free(rb_mem);
+    if (mpeg_mem) free(mpeg_mem);
+    if (ddrtop) free(ddrtop);
+    if (frame) free(frame);
+    if (decode_buffer) free(decode_buffer);
+    if (file >= 0) sceIoClose(file);
     return result;
 }
 
@@ -849,10 +890,10 @@ static void open_selected(int selected)
             draw_page("INTRO STOPPED", "Playback was stopped. Press O to return.");
         else
             draw_page("VIDEO PLAYER ERROR",
-                      "Could not decode the intro. Check PLAYBACK.LOG on the Memory Stick.");
+                      "Could not open or decode the intro. Check that INTRO.PMF and "
+                      "INTRO.PCM are beside EBOOT.PBP in the game folder.");
     } else if (selected == 2) {
-        draw_page("CREDITS",
-                  "LittleBigPlanet PSP: Alpha\nHomebrew boot and video player prototype.");
+        draw_page("CREDITS", "LittleBigPlanet PSP: Alpha\nHomebrew boot and video player prototype.");
     } else {
         sceKernelExitGame();
     }
@@ -871,16 +912,17 @@ int main(void)
     sceCtrlSetSamplingMode(PSP_CTRL_MODE_DIGITAL);
     pspDebugScreenInit();
 
-    /* Required boot flow: 3-second loading screen, 2-second black, auto intro. */
+    /* Automatic boot sequence: splash (3 s), black (2 s), then intro. */
     show_startup_splash();
     startup_status = play_intro();
     if (startup_status < 0) {
-        char error_body[256];
-        snprintf(error_body, sizeof(error_body),
-                 "Failed at: %s\nError code: 0x%08X\n\n"
-                 "Diagnostic log: ms0:/PSP/GAME/LBPPSP_ALPHA/PLAYBACK.LOG",
-                 last_playback_stage, (unsigned int)last_playback_error);
-        draw_page("INTRO PLAYER ERROR", error_body);
+        {
+            char error_body[256];
+            snprintf(error_body, sizeof(error_body),
+                     "Failed at: %s\nError code: 0x%08X\n\nA diagnostic log is also attempted at ms0:/PLAYBACK.LOG.",
+                     last_playback_stage, (unsigned int)last_playback_error);
+            draw_page("INTRO PLAYER ERROR", error_body);
+        }
         for (;;) {
             sceCtrlReadBufferPositive(&pad, 1);
             if (pad.Buttons & PSP_CTRL_CIRCLE)
@@ -889,29 +931,27 @@ int main(void)
         }
     }
 
+    selected = 0;
     draw_menu(selected);
+
     for (;;) {
         unsigned int pressed;
         sceCtrlReadBufferPositive(&pad, 1);
         pressed = pad.Buttons & ~previous;
         previous = pad.Buttons;
-        if (pad.Buttons & PSP_CTRL_HOME)
-            sceKernelExitGame();
+        if (pad.Buttons & PSP_CTRL_HOME) sceKernelExitGame();
         if (pressed & PSP_CTRL_UP) {
-            if (selected > 0)
-                --selected;
+            if (selected > 0) --selected;
             draw_menu(selected);
         } else if (pressed & PSP_CTRL_DOWN) {
-            if (selected < 3)
-                ++selected;
+            if (selected < 3) ++selected;
             draw_menu(selected);
         } else if (pressed & PSP_CTRL_CROSS) {
             open_selected(selected);
             if (selected != 3) {
-                for (;;) {
+                while (1) {
                     sceCtrlReadBufferPositive(&pad, 1);
-                    if (pad.Buttons & PSP_CTRL_CIRCLE)
-                        break;
+                    if (pad.Buttons & PSP_CTRL_CIRCLE) break;
                     sceKernelDelayThread(1000 * 1000 / 60);
                 }
                 draw_menu(selected);
