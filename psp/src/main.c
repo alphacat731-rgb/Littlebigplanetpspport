@@ -65,14 +65,6 @@ static unsigned int __attribute__((aligned(16))) gu_list[8192];
 static const char *last_playback_stage = "not started";
 static int last_playback_error = 0;
 
-static unsigned int read_be32(const unsigned char *p)
-{
-    return ((unsigned int)p[0] << 24) |
-           ((unsigned int)p[1] << 16) |
-           ((unsigned int)p[2] << 8) |
-           (unsigned int)p[3];
-}
-
 static int exit_callback(int a, int b, void *c)
 {
     (void)a; (void)b; (void)c;
@@ -385,7 +377,7 @@ static void gu_video_frame(void *frame)
     vertices[1].x = SCREEN_W;
     vertices[1].y = SCREEN_H;
     vertices[1].z = 0;
-    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BIT | GU_VERTEX_16BIT |
+    sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT |
                    GU_TRANSFORM_2D, 2, NULL, vertices);
     sceGuFinish();
     sceGuSync(0, 0);
@@ -432,7 +424,7 @@ static void show_startup_splash(void)
         v[0].u = 0; v[0].v = 0; v[0].x = 0; v[0].y = 0; v[0].z = 0;
         v[1].u = SCREEN_W; v[1].v = SCREEN_H;
         v[1].x = SCREEN_W; v[1].y = SCREEN_H; v[1].z = 0;
-        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_32BIT | GU_VERTEX_16BIT |
+        sceGuDrawArray(GU_SPRITES, GU_TEXTURE_16BIT | GU_VERTEX_16BIT |
                        GU_TRANSFORM_2D, 2, NULL, v);
     }
     sceGuFinish();
@@ -483,8 +475,8 @@ static int play_intro(void)
     int gu_ready = 0;
     int audio_started = 0;
     int frames = 0;
-    int decode_status = 0;
-    int unknown = 0;
+    SceInt32 decode_status = 0;
+    SceInt32 unknown = 0;
     int ring_size;
     int mpeg_size;
     int idle_polls = 0;
@@ -616,8 +608,8 @@ static int play_intro(void)
 
     last_playback_stage = "Reading PSMF stream offset";
     {
-        int stream_offset = 0;
-        int stream_size = 0;
+        SceInt32 stream_offset = 0;
+        SceInt32 stream_size = 0;
         int ret = sceMpegQueryStreamOffset(&mpeg, header, &stream_offset);
         if (ret < 0) {
             set_playback_failure("Reading PSMF stream offset", ret);
