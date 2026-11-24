@@ -10,6 +10,7 @@ START_PTS = 90000
 SCR_DELAY = 76850
 SCR_STEP = 44237
 MUX_RATE = 25000
+PES_EXT_PSTD = bytes.fromhex('1e6050')  # P-STD buffer bound: 80 KiB
 
 
 def run(cmd: list[str]) -> None:
@@ -52,6 +53,19 @@ class BitWriter:
         return bytes(out)
 
 
+def scr_bytes(scr27: int) -> bytes:
+    # Sony PMF pack SCR encoding, including the required marker bits.
+    base, ext = divmod(scr27, 300)
+    return bytes((
+        0x44 | ((base >> 27) & 0x38) | ((base >> 28) & 0x03),
+        (base >> 20) & 0xff,
+        ((base >> 12) & 0xf8) | 0x04 | ((base >> 13) & 0x03),
+        (base >> 5) & 0xff,
+        ((base << 3) & 0xf8) | 0x04 | ((ext >> 7) & 0x03),
+        ((ext << 1) & 0xfe) | 1,
+    ))
+
+
 def pack_header(scr27: int) -> bytes:
     base, ext = divmod(scr27, 300)
     b = BitWriter()
@@ -71,9 +85,15 @@ def padding_packet(size: int) -> bytes:
     return b'\x00\x00\x01\xbe' + u16(size - 6) + b'\xff' * (size - 6)
 
 
-def video_pes_header(payload_len: int, pts: int | None, dts: int | None) -> bytes:
+def video_pes_header(payload_len: int, pts: int | None, dts: int | None,
+                     pstd: bool = False) -> bytes:
     if pts is None or dts is None:
         opt = b'\x80\x00\x00'
+    elif pstd:
+        # Sony PMF samples set PES_extension_flag and repeat the 80 KiB
+        # P-STD bound at the first video PES of each GOP.
+        opt = (b'\x81\xc1\x0d' + pts_bytes(3, pts) +
+               pts_bytes(1, dts) + PES_EXT_PSTD)
     else:
         opt = b'\x81\xc0\x0a' + pts_bytes(3, pts) + pts_bytes(1, dts)
     packet_len = len(opt) + payload_len
@@ -237,8 +257,13 @@ def validate_psmf_layout(path: Path, aus: list[tuple[bytes, bool]],
                      for i in range(table_count)]
     if indexed_sizes != first_gop_sizes:
         raise ValueError('first GOP index sizes do not match encoded access units')
-    if stream[pos + 6 + bf_size:pos + 10 + bf_size] != b'\x00\x00\x01\xe0':
+    pes_pos = pos + 6 + bf_size
+    if stream[pes_pos:pes_pos + 4] != b'\x00\x00\x01\xe0':
         raise ValueError('video PES does not follow the first GOP index packet')
+    if stream[pes_pos + 6:pes_pos + 9] != b'\x81\xc1\x0d':
+        raise ValueError('first GOP PES is missing the P-STD PES extension')
+    if stream[pes_pos + 19:pes_pos + 22] != PES_EXT_PSTD:
+        raise ValueError('first GOP PES contains an invalid 80 KiB P-STD bound')
 
     for sector in range(0, stream_size, SECTOR):
         if stream[sector:sector + 4] != b'\x00\x00\x01\xba':
@@ -253,7 +278,6 @@ def mux_video(aus: list[tuple[bytes, bool]], width: int, height: int) -> bytes:
         raise ValueError('first access unit must be an IDR frame')
     next_key = {start: (keyframes[n+1] if n+1 < len(keyframes) else len(aus)) for n, start in enumerate(keyframes)}
     sectors = bytearray()
-    last_scr = -SCR_STEP
 
     for frame_index, (au, idr) in enumerate(aus):
         pts = START_PTS + frame_index * FPS_PTS
@@ -272,7 +296,8 @@ def mux_video(aus: list[tuple[bytes, bool]], width: int, height: int) -> bytes:
         while remaining:
             p_pts = pts if first_packet else None
             p_dts = dts if first_packet else None
-            empty_header = video_pes_header(0, p_pts, p_dts)
+            pstd = first_packet and idr
+            empty_header = video_pes_header(0, p_pts, p_dts, pstd)
             capacity = SECTOR - 14 - len(extra) - len(empty_header)
             payload_len = min(len(remaining), capacity)
             spare = capacity - payload_len
@@ -282,20 +307,27 @@ def mux_video(aus: list[tuple[bytes, bool]], width: int, height: int) -> bytes:
                 raise ValueError('PES metadata leaves no room for H.264 data')
             payload = bytes(remaining[:payload_len])
             remaining = remaining[payload_len:]
-            pes = video_pes_header(payload_len, p_pts, p_dts)
+            pes = video_pes_header(payload_len, p_pts, p_dts, pstd)
             pad = padding_packet(SECTOR - 14 - len(extra) - len(pes) - payload_len)
             sector_body = extra + pes + payload + pad
             if len(sector_body) != SECTOR - 14:
                 raise AssertionError(f'internal sector size mismatch: {len(sector_body)}')
 
-            target = max(0, (dts - SCR_DELAY) * 300)
-            if first_packet:
-                last_scr = last_scr + SCR_STEP if last_scr + SCR_STEP > target else target
-            else:
-                last_scr += SCR_STEP
-            sectors += pack_header(last_scr) + sector_body
+            # SCR values are patched after muxing so every pack follows the
+            # Sony reference cadence derived from total PTS span / pack count.
+            sectors += pack_header(0) + sector_body
             extra = b''
             first_packet = False
+
+    packet_count = len(sectors) // SECTOR
+    if packet_count <= 0 or len(sectors) % SECTOR:
+        raise ValueError('program stream is not a whole number of 2048-byte packs')
+    scr0 = (START_PTS - FPS_PTS - SCR_DELAY) * 300
+    total_pts = len(aus) * FPS_PTS
+    pace = max(SCR_STEP, min(FPS_PTS * 300, total_pts * 300 // packet_count))
+    for packet_index in range(packet_count):
+        pack_start = packet_index * SECTOR
+        sectors[pack_start + 4:pack_start + 10] = scr_bytes(scr0 + packet_index * pace)
 
     return make_psmf_header(bytes(sectors), len(aus), width, height) + bytes(sectors)
 
