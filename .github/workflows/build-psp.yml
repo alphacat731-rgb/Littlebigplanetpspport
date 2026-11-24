@@ -85,8 +85,8 @@ jobs:
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/workspace" \
             -w /workspace/psp \
-            pspdev/pspdev:latest make 2>&1 | tee build/psp-build.log
-          if grep -q "could not fixup imports" build/psp-build.log; then
+            pspdev/pspdev:latest make 2>&1 | tee ../build/psp-build.log
+          if grep -q "could not fixup imports" ../build/psp-build.log; then
             echo "PSPSDK import-table fixup failed; refusing to package this EBOOT."
             exit 1
           fi
