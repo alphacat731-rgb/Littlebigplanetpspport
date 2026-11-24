@@ -552,6 +552,7 @@ static int play_intro(void)
         }
     }
     mpeg_initialized = 1;
+    playback_log("sceMpegInit succeeded");
 
     /* Mode 0 is the standard sceMpeg player path used by PSPRelay. */
     ring_size = sceMpegRingbufferQueryMemSize(RING_PACKETS);
@@ -580,6 +581,7 @@ static int play_intro(void)
         }
     }
     ring_ready = 1;
+    playback_log("512-packet MPEG ringbuffer constructed");
 
     last_playback_stage = "Creating mode-0 MPEG decoder";
     {
@@ -591,22 +593,21 @@ static int play_intro(void)
         }
     }
     mpeg_ready = 1;
+    playback_log("mode-0 sceMpeg decoder created");
+
+    mode.iUnk0 = -1;
+    mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
+    last_playback_stage = "Setting AVC decode mode";
+    {
+        int ret = sceMpegAvcDecodeMode(&mpeg, &mode);
+        if (ret < 0) {
+            set_playback_failure("Setting AVC decode mode", ret);
+            goto cleanup;
+        }
+    }
+    playback_log("AVC pixel format configured before stream registration");
 
     last_playback_stage = "Reading PSMF stream offset";
-    {
-        int ret = sceMpegQueryStreamOffset(&mpeg, header, &unknown);
-        if (ret < 0) {
-            set_playback_failure("Reading PSMF stream offset", ret);
-            goto cleanup;
-        }
-    }
-    {
-        int ret = sceMpegQueryStreamSize(header, &unknown);
-        if (ret < 0) {
-            set_playback_failure("Reading PSMF stream size", ret);
-            goto cleanup;
-        }
-    }
     {
         int stream_offset = 0;
         int stream_size = 0;
@@ -648,6 +649,7 @@ static int play_intro(void)
         goto cleanup;
     }
     stream_ready = 1;
+    playback_log("AVC stream registered");
 
     last_playback_stage = "Allocating AVC ES buffer";
     es_buffer = sceMpegMallocAvcEsBuf(&mpeg);
@@ -655,23 +657,13 @@ static int play_intro(void)
         set_playback_failure("Allocating AVC ES buffer", -7);
         goto cleanup;
     }
+    playback_log("SDK AVC ES buffer allocated");
     memset(&au, 0xFF, sizeof(au));
     last_playback_stage = "Initializing AVC access unit";
     {
         int ret = sceMpegInitAu(&mpeg, es_buffer, &au);
         if (ret < 0) {
             set_playback_failure("Initializing AVC access unit", ret);
-            goto cleanup;
-        }
-    }
-
-    mode.iUnk0 = -1;
-    mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
-    last_playback_stage = "Setting AVC decode mode";
-    {
-        int ret = sceMpegAvcDecodeMode(&mpeg, &mode);
-        if (ret < 0) {
-            set_playback_failure("Setting AVC decode mode", ret);
             goto cleanup;
         }
     }
@@ -750,7 +742,7 @@ static int play_intro(void)
              */
             decoded = sceMpegAvcDecode(&mpeg, &au, FRAME_WIDTH, &frame,
                                        &decode_status);
-            if (decoded < 0) {
+            if (decoded != 0) {
                 set_playback_failure("Decoding AVC frame", decoded);
                 goto cleanup;
             }
@@ -819,10 +811,10 @@ cleanup:
     playback_log(logbuf);
     pcm_stop(&audio);
 
-    if (stream_ready)
-        sceMpegUnRegistStream(mpeg, stream);
     if (es_buffer && mpeg_ready)
         sceMpegFreeAvcEsBuf(&mpeg, es_buffer);
+    if (stream_ready)
+        sceMpegUnRegistStream(mpeg, stream);
     if (mpeg_ready)
         sceMpegDelete(&mpeg);
     if (ring_ready)
