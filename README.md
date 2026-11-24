@@ -1,72 +1,67 @@
 # LittleBigPlanet PSP: Alpha
 
-This repository contains a bootable PSP homebrew prototype with an automatic startup sequence and an in-game intro-video player.
+This repository builds a bootable PSP homebrew prototype with an automatic startup sequence and an in-game intro-video player.
 
-## Startup sequence
+## Automatic startup
 
-When the application launches, it automatically:
+1. The loading-screen image is shown for 3 seconds.
+2. The screen holds black for 2 seconds.
+3. The intro video starts automatically, with its soundtrack.
+4. The prototype menu appears after the intro ends.
 
-1. Displays the repository's loading-screen image for **3 seconds**.
-2. Shows a black screen for **2 seconds**.
-3. Starts the intro video automatically, including its synchronized soundtrack.
-4. Opens the prototype menu after the intro finishes. Press **X** to pause/resume during playback or **O** to stop the intro and go to the menu.
+During playback, X pauses or resumes the soundtrack clock and O stops the intro and returns to the menu. The D-pad selects menu items.
 
-No menu selection is required to start the video.
+## Rebuilt media pipeline
 
-## What the workflow builds
+The repository's original video input is a VP9/Opus file carrying an MP4 suffix. The build no longer feeds that mismatched container directly into the PMF muxer.
 
-On every push or pull request to `main`, and when started manually, GitHub Actions:
+GitHub Actions now:
+1. Decodes the original source and writes a fresh MP4 with H.264 Constrained Baseline video (480x272, yuv420p, no B-frames) and AAC stereo audio (44.1 kHz).
+2. Fully decodes both streams and validates the new MP4 before accepting it.
+3. Copies the validated H.264 stream into a Sony PSMF/PMF video container with 2048-byte MPEG packs, GOP access-unit indexes, and PSMF header/stream descriptors.
+4. Extracts the fresh AAC soundtrack to 44.1 kHz stereo PCM for the homebrew audio thread.
+5. Compiles the PSP executable from a clean PSPSDK build and assembles the Memory Stick package.
 
-1. Validates the presentation PNGs and source intro video.
-2. Converts the intro to a 480×272 H.264 Baseline PSMF/PMF cutscene for the PSP Media Engine.
-3. Converts the source soundtrack to 44.1 kHz stereo 16-bit PCM. The EBOOT plays it through PSP audio output in sync with the video's presentation timestamps.
-4. Converts the loading-screen PNG to a 512×512 RGBA texture that the PSP startup code displays.
-5. Compiles and packages `psp/EBOOT.PBP` with PSPSDK, validates the PBP structure, and assembles the Memory Stick folder.
+The clean MP4 is included in the workflow artifact for inspection. It is a build input, not the file the PSP plays. PSP sceMpeg playback uses the PMF container, not a plain MP4. The installed folder contains INTRO.PMF, INTRO.PCM, and LOADING.RGBA.
 
-The workflow is in [Build LBPPSP Alpha](.github/workflows/build-psp.yml).
+## Player implementation
 
-## Install on a PSP or PPSSPP
+The AVC decoder was rebuilt around the normal PSPSDK sceMpeg flow: mode 0, a 512-packet ringbuffer, sceMpegMallocAvcEsBuf, and an eDRAM frame surface after the GU draw/display buffers. The decoded output pointer is passed by double indirection and only displayed when the decoder reports a completed frame.
 
-Copy the generated `dist/PSP` folder to the root of the Memory Stick. The game directory contains:
+The earlier hand-written AVC detail/YUV structure declarations and custom color-space-conversion path have been removed.
 
-- `PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP` — the bootable application.
-- `PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA` — the loading screen texture.
-- `PSP/GAME/LBPPSP_ALPHA/INTRO.PMF` — the in-game H.264 cutscene.
-- `PSP/GAME/LBPPSP_ALPHA/INTRO.PCM` — the synchronized 44.1 kHz stereo soundtrack.
+Technical references used to verify the playback approach:
+- PSPSDK MPEG API: https://github.com/pspdev/pspsdk/blob/master/src/mpeg/pspmpeg.h
+- PPSSPP MPEG/PSMF internals: https://www.ppsspp.org/docs/development/ppsspp-internals/mpeg/
+- PSPRelay PSP/PPSSPP H.264 player: https://github.com/SarahRoseLives/PSPRelay
 
-Launch the application under **Game → Memory Stick**. The loading screen, two-second black interval, and intro start automatically. Keep all three media files beside `EBOOT.PBP`.
+## Install on PSP or PPSSPP
 
-## Current project scope
+Download LBPPSP_ALPHA_build.zip from the successful GitHub Actions artifact. Extract it and copy its dist/PSP folder to the root of the Memory Stick.
 
-The EBOOT is still a bootable prototype shell with a startup sequence, video player, controller input, and credits. **It does not contain the original LittleBigPlanet gameplay systems.** The repository currently contains presentation/media assets, not the original game's source code.
+The final layout must be:
 
-## Presentation assets
+    ms0:/PSP/GAME/LBPPSP_ALPHA/
+        EBOOT.PBP
+        INTRO.PMF
+        INTRO.PCM
+        LOADING.RGBA
 
-The EBOOT package embeds:
+Launch it under Game > Memory Stick.
 
-- `LBPPSP_Alpha_ICON0.png` as the XMB icon.
-- `LBPPSP_Alpha_LoadingScreen.png` as PIC0 and as the in-game startup image source.
-- `LBPPSP_Alpha_PIC1.png` as the XMB background.
+If playback fails, retrieve PLAYBACK.LOG from the game folder. A fallback log is also written to ms0:/PLAYBACK.LOG.
 
-The MP3 source named `LBPPSP_Alpha_Savedata_SND0.ogg.mp3` is preserved in the repository but is not packed as `SND0.AT3`.
+## Project scope
+
+This repository currently contains the bootable homebrew shell, menu, video playback code, and media/presentation assets. It does not contain the original LittleBigPlanet PSP source code or its complete gameplay systems, so this build is a bootable prototype foundation rather than a rebuilt copy of the original game.
 
 ## Local build
 
-The media conversion requires FFmpeg. The PSP build requires Docker and the PSPSDK image:
+The media pipeline requires FFmpeg and Python 3.12. The PSP executable requires Docker and the PSPSDK image:
 
-```bash
-python scripts/validate_assets.py
-python scripts/build_intro_pmf.py \
-  --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
-  --output build/LBPPSP_ALPHA_INTRO.PMF \
-  --audio-output build/LBPPSP_ALPHA_INTRO.PCM
-ffmpeg -hide_banner -loglevel error -y \
-  -i "LBPPSP_Alpha_LoadingScreen.png" \
-  -vf "scale=480:272:flags=lanczos,format=rgba,pad=512:512:0:0:color=black" \
-  -frames:v 1 -pix_fmt rgba -f rawvideo build/LOADING.RGBA
-docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make clean
-docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make
-python scripts/validate_pbp.py psp/EBOOT.PBP
-```
-
-The generated executable is `psp/EBOOT.PBP`.
+    python scripts/prepare_intro_mp4.py
+    python scripts/validate_assets.py
+    python scripts/build_intro_pmf.py --input build/LBPPSP_ALPHA_INTRO_SOURCE.mp4 --output build/LBPPSP_ALPHA_INTRO.PMF --audio-output build/LBPPSP_ALPHA_INTRO.PCM
+    docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make clean
+    docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make
+    python scripts/validate_pbp.py psp/EBOOT.PBP
