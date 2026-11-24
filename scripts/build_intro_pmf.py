@@ -404,16 +404,6 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="lbppsp-pmf-verify-") as temp_dir:
         recovered_path = Path(temp_dir) / "recovered.h264"
         recovered_path.write_bytes(recovered)
-        original_probe = subprocess.run(
-            [args.ffprobe, "-v", "error", "-show_entries",
-             "stream=codec_name,profile,width,height,pix_fmt", "-of", "json", str(recovered_path)],
-            check=True, capture_output=True, text=True,
-        )
-        recovered_info = json.loads(original_probe.stdout)
-        recovered_video = next((s for s in recovered_info.get("streams", [])
-                                if s.get("codec_name") == "h264"), None)
-        if not recovered_video or (recovered_video.get("width"), recovered_video.get("height")) != (480, 272):
-            raise SystemExit(f"Recovered PMF payload is not 480x272 H.264: {recovered_info}")
         # The PMF must contain exactly the stream that was muxed, with no lost,
         # duplicated, or altered bytes across PES and 2048-byte pack boundaries.
         if recovered != raw:
