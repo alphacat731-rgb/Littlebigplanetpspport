@@ -7,7 +7,7 @@ from pathlib import Path
 SECTOR = 2048
 FPS_PTS = 3003
 START_PTS = 90000
-SCR_DELAY = 56850
+SCR_DELAY = 76850
 SCR_STEP = 44237
 MUX_RATE = 25000
 
@@ -121,14 +121,22 @@ def split_access_units(raw: bytes) -> list[tuple[bytes, bool]]:
     return aus
 
 
-SYSTEM_HEADER = bytes.fromhex('000001bb000c80c35180f07fb9e0fbbde308')
+SYSTEM_HEADER = bytes.fromhex('000001bb000c80c35180f07fb9e050bde008')
 
-def private_stream2(frame_sizes: list[int]) -> bytes:
-    payload = bytearray(bytes.fromhex('01e0000400040005000600000000'))
+def private_stream2(frame_sizes: list[int], first_chunk: bool) -> bytes:
+    # Sony-layout PSMF private_stream_2 GOP index (0xBF). The first GOP and
+    # subsequent GOPs use different six-word headers; the remaining table
+    # records each access unit's flags and byte length.
+    if not frame_sizes:
+        raise ValueError('GOP index table must contain at least one access unit')
+    header_words = (0, 0, 1, 1, 0, 0) if first_chunk else (0, 1, 1, 2, 0, 0)
+    payload = bytearray(b'\x01\xe0')
+    for value in header_words:
+        payload += u16(value)
     payload += u16(2 + 4 * len(frame_sizes))
     payload += u16(len(frame_sizes))
     for index, size in enumerate(frame_sizes):
-        payload += u16(0 if index == len(frame_sizes) - 1 else 0x80)
+        payload += u16(0x0000 if index == len(frame_sizes) - 1 else 0x0080)
         payload += u16(size)
     if len(payload) > 0xffff:
         raise ValueError('GOP index table is too large')
@@ -141,26 +149,102 @@ def make_psmf_header(stream: bytes, frame_count: int, width: int, height: int) -
     h[8:12] = u32(0x800)
     h[12:16] = u32(len(stream))
     end_pts = START_PTS + frame_count * FPS_PTS
+
+    # Match the PSMF0014 field layout used by Sony's reference PMF samples.
+    # The six-byte timestamps at 0x6E and 0x74 are a second stream-table
+    # timestamp pair, not 32-bit fields at 0x70 and 0x76.
     h[0x50:0x54] = u32(0x3e)
     h[0x54:0x5a] = u48(START_PTS)
     h[0x5a:0x60] = u48(end_pts)
     h[0x60:0x64] = u32(MUX_RATE)
-    h[0x64:0x68] = u32(START_PTS)
-    h[0x68] = 1  # one stream, video only
-    h[0x69] = 1
+    h[0x68:0x6a] = bytes((1, 1))  # one video stream
     h[0x6a:0x6e] = u32(0x24)
-    h[0x70:0x74] = u32(START_PTS)
-    h[0x74:0x76] = u16(0)
-    h[0x76:0x7a] = u32(end_pts)
+    h[0x6e:0x74] = u48(START_PTS)
+    h[0x74:0x7a] = u48(end_pts)
     h[0x7a:0x7c] = u16(1)
     h[0x7c:0x80] = u32(0x12)
     h[0x80:0x82] = u16(1)
-    h[0x82] = 0xe0
-    h[0x83] = 0
-    h[0x84:0x86] = bytes((0x20, 0xfb))
-    h[0x8e] = width // 16
-    h[0x8f] = height // 16
+
+    # P-STD video buffer bound: scale=0, size=0x050 (80 KiB).
+    # The stream ID is MPEG video stream 0 (0xE0).
+    stream_entry = bytes((
+        0xe0, 0x00, 0x20, 0x50,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        width // 16, height // 16, 0, 0,
+    ))
+    h[0x82:0x92] = stream_entry
     return bytes(h)
+
+
+def validate_psmf_layout(path: Path, aus: list[tuple[bytes, bool]],
+                         width: int, height: int) -> None:
+    data = path.read_bytes()
+    if len(data) < 0x800 + SECTOR or data[:8] != b'PSMF0014':
+        raise ValueError('Generated file has no complete PSMF0014 header')
+    h = data[:0x800]
+    stream_offset = int.from_bytes(h[8:12], 'big')
+    stream_size = int.from_bytes(h[12:16], 'big')
+    end_pts = START_PTS + len(aus) * FPS_PTS
+    expected_entry = bytes((
+        0xe0, 0x00, 0x20, 0x50,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        width // 16, height // 16, 0, 0,
+    ))
+    checks = (
+        (stream_offset == 0x800, 'stream offset must be 0x800'),
+        (stream_size == len(data) - 0x800, 'header stream size does not match file'),
+        (stream_size > 0 and stream_size % SECTOR == 0, 'program stream must be sector aligned'),
+        (h[0x50:0x54] == u32(0x3e), 'invalid PSMF fixed header field'),
+        (h[0x54:0x5a] == u48(START_PTS), 'invalid first PSMF timestamp'),
+        (h[0x5a:0x60] == u48(end_pts), 'invalid last PSMF timestamp'),
+        (h[0x60:0x64] == u32(MUX_RATE), 'invalid mux rate'),
+        (h[0x64:0x68] == b'\\x00' * 4, 'reserved PSMF header bytes must be zero'),
+        (h[0x68:0x6a] == bytes((1, 1)), 'invalid video stream counts'),
+        (h[0x6a:0x6e] == u32(0x24), 'invalid PSMF stream-table header'),
+        (h[0x6e:0x74] == u48(START_PTS), 'invalid stream-table first timestamp'),
+        (h[0x74:0x7a] == u48(end_pts), 'invalid stream-table last timestamp'),
+        (h[0x7a:0x7c] == u16(1), 'invalid PSMF stream-table count'),
+        (h[0x7c:0x80] == u32(0x12), 'invalid PSMF stream-table size'),
+        (h[0x80:0x82] == u16(1), 'expected exactly one stream entry'),
+        (h[0x82:0x92] == expected_entry, 'invalid video stream/P-STD entry'),
+    )
+    for passed, message in checks:
+        if not passed:
+            raise ValueError(f'PSMF layout validation failed: {message}')
+
+    stream = data[stream_offset:]
+    if stream[:4] != b'\\x00\\x00\\x01\\xba':
+        raise ValueError('program stream does not begin with an MPEG-2 pack')
+    if len(pack_header(0)) != 14:
+        raise ValueError('MPEG-2 pack header must be 14 bytes')
+    pos = 14
+    if stream[pos:pos + len(SYSTEM_HEADER)] != SYSTEM_HEADER:
+        raise ValueError('first pack is missing the Sony-layout system header')
+    pos += len(SYSTEM_HEADER)
+    if stream[pos:pos + 4] != b'\\x00\\x00\\x01\\xbf':
+        raise ValueError('first pack is missing the private_stream_2 GOP index')
+    bf_size = int.from_bytes(stream[pos + 4:pos + 6], 'big')
+    bf = stream[pos + 6:pos + 6 + bf_size]
+    if len(bf) != bf_size or bf[:2] != b'\\x01\\xe0' or bf_size < 18:
+        raise ValueError('first GOP index packet is truncated or malformed')
+    table_size = int.from_bytes(bf[14:16], 'big')
+    table_count = int.from_bytes(bf[16:18], 'big')
+    next_idr = next((i for i in range(1, len(aus)) if aus[i][1]), len(aus))
+    first_gop_sizes = [len(aus[i][0]) for i in range(next_idr)]
+    if table_size != 2 + 4 * table_count or table_count != len(first_gop_sizes):
+        raise ValueError('first GOP index count/length does not match its access units')
+    indexed_sizes = [int.from_bytes(bf[20 + 4 * i:22 + 4 * i], 'big')
+                     for i in range(table_count)]
+    if indexed_sizes != first_gop_sizes:
+        raise ValueError('first GOP index sizes do not match encoded access units')
+    if stream[pos + 6 + bf_size:pos + 10 + bf_size] != b'\\x00\\x00\\x01\\xe0':
+        raise ValueError('video PES does not follow the first GOP index packet')
+
+    for sector in range(0, stream_size, SECTOR):
+        if stream[sector:sector + 4] != b'\\x00\\x00\\x01\\xba':
+            raise ValueError(f'MPEG pack start code missing at stream sector {sector // SECTOR}')
+    print('PSMF layout validation: PSMF0014 fields, Sony P-STD/system header, '
+          'GOP index and 2048-byte packs passed')
 
 
 def mux_video(aus: list[tuple[bytes, bool]], width: int, height: int) -> bytes:
@@ -177,7 +261,12 @@ def mux_video(aus: list[tuple[bytes, bool]], width: int, height: int) -> bytes:
         extra = b''
         if idr:
             gop_end = next_key[frame_index]
-            extra = SYSTEM_HEADER + private_stream2([len(aus[n][0]) for n in range(frame_index, gop_end)])
+            # The system header is emitted once at program-stream start.
+            # Every IDR GOP has its own correctly typed BF access-unit index.
+            extra = (SYSTEM_HEADER if frame_index == 0 else b'') + private_stream2(
+                [len(aus[n][0]) for n in range(frame_index, gop_end)],
+                first_chunk=(frame_index == 0),
+            )
         remaining = memoryview(au)
         first_packet = True
         while remaining:
@@ -243,6 +332,7 @@ def main() -> None:
         aus = split_access_units(raw)
         pmf = mux_video(aus, 480, 272)
         target.write_bytes(pmf)
+        validate_psmf_layout(target, aus, 480, 272)
         run([args.ffmpeg, '-hide_banner', '-y', '-i', str(source), '-map', '0:a:0', '-vn', '-sn', '-dn',
              '-ar', '44100', '-ac', '2', '-c:a', 'pcm_s16le', '-f', 's16le', str(audio_target)])
     # Probe the generated PSMF and force a full decode before accepting it.
