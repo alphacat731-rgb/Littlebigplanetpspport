@@ -198,7 +198,7 @@ def validate_psmf_layout(path: Path, aus: list[tuple[bytes, bool]],
         (h[0x54:0x5a] == u48(START_PTS), 'invalid first PSMF timestamp'),
         (h[0x5a:0x60] == u48(end_pts), 'invalid last PSMF timestamp'),
         (h[0x60:0x64] == u32(MUX_RATE), 'invalid mux rate'),
-        (h[0x64:0x68] == b'\\x00' * 4, 'reserved PSMF header bytes must be zero'),
+        (h[0x64:0x68] == b'\x00' * 4, 'reserved PSMF header bytes must be zero'),
         (h[0x68:0x6a] == bytes((1, 1)), 'invalid video stream counts'),
         (h[0x6a:0x6e] == u32(0x24), 'invalid PSMF stream-table header'),
         (h[0x6e:0x74] == u48(START_PTS), 'invalid stream-table first timestamp'),
@@ -213,7 +213,7 @@ def validate_psmf_layout(path: Path, aus: list[tuple[bytes, bool]],
             raise ValueError(f'PSMF layout validation failed: {message}')
 
     stream = data[stream_offset:]
-    if stream[:4] != b'\\x00\\x00\\x01\\xba':
+    if stream[:4] != b'\x00\x00\x01\xba':
         raise ValueError('program stream does not begin with an MPEG-2 pack')
     if len(pack_header(0)) != 14:
         raise ValueError('MPEG-2 pack header must be 14 bytes')
@@ -221,11 +221,11 @@ def validate_psmf_layout(path: Path, aus: list[tuple[bytes, bool]],
     if stream[pos:pos + len(SYSTEM_HEADER)] != SYSTEM_HEADER:
         raise ValueError('first pack is missing the Sony-layout system header')
     pos += len(SYSTEM_HEADER)
-    if stream[pos:pos + 4] != b'\\x00\\x00\\x01\\xbf':
+    if stream[pos:pos + 4] != b'\x00\x00\x01\xbf':
         raise ValueError('first pack is missing the private_stream_2 GOP index')
     bf_size = int.from_bytes(stream[pos + 4:pos + 6], 'big')
     bf = stream[pos + 6:pos + 6 + bf_size]
-    if len(bf) != bf_size or bf[:2] != b'\\x01\\xe0' or bf_size < 18:
+    if len(bf) != bf_size or bf[:2] != b'\x01\xe0' or bf_size < 18:
         raise ValueError('first GOP index packet is truncated or malformed')
     table_size = int.from_bytes(bf[14:16], 'big')
     table_count = int.from_bytes(bf[16:18], 'big')
@@ -237,11 +237,11 @@ def validate_psmf_layout(path: Path, aus: list[tuple[bytes, bool]],
                      for i in range(table_count)]
     if indexed_sizes != first_gop_sizes:
         raise ValueError('first GOP index sizes do not match encoded access units')
-    if stream[pos + 6 + bf_size:pos + 10 + bf_size] != b'\\x00\\x00\\x01\\xe0':
+    if stream[pos + 6 + bf_size:pos + 10 + bf_size] != b'\x00\x00\x01\xe0':
         raise ValueError('video PES does not follow the first GOP index packet')
 
     for sector in range(0, stream_size, SECTOR):
-        if stream[sector:sector + 4] != b'\\x00\\x00\\x01\\xba':
+        if stream[sector:sector + 4] != b'\x00\x00\x01\xba':
             raise ValueError(f'MPEG pack start code missing at stream sector {sector // SECTOR}')
     print('PSMF layout validation: PSMF0014 fields, Sony P-STD/system header, '
           'GOP index and 2048-byte packs passed')
