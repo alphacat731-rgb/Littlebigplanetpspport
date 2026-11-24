@@ -26,9 +26,9 @@ The clean MP4 is included in the workflow artifact for inspection. It is a build
 
 ## Player implementation
 
-The AVC decoder was rebuilt around the normal PSPSDK sceMpeg flow: mode 0, a 512-packet ringbuffer, sceMpegMallocAvcEsBuf, and an eDRAM frame surface after the GU draw/display buffers. The decoded output pointer is passed by double indirection and only displayed when the decoder reports a completed frame.
+The AVC decoder uses the PSP's low-resolution hardware path for this 480x272 video. It queries MPEG memory with mode 4, creates a 4 MiB-aligned 2 MiB Media Engine workspace, passes that workspace to sceMpegCreate, and places the AVC access-unit buffer at workspace + 0x10000. The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels, following the established PMPlayer Advance initialization pattern.
 
-The earlier hand-written AVC detail/YUV structure declarations and custom color-space-conversion path have been removed.
+Decoded YCbCr planes are obtained with sceMpegAvcDecodeDetail2 and converted to the 8888 texture through sceMpegBaseCscAvc. The player keeps the converted texture in aligned main RAM, handles cache coherency before GU upload, and records detailed playback diagnostics. The PPSSPP-only direct-output fallback is used only if its HLE rejects the hardware-style NULL output argument.
 
 Technical references used to verify the playback approach:
 - PSPSDK MPEG API: https://github.com/pspdev/pspsdk/blob/master/src/mpeg/pspmpeg.h
