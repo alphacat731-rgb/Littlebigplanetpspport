@@ -110,54 +110,62 @@ def video_pes_header(payload_size: int, pts: int | None, dts: int | None) -> byt
     return b"\x00\x00\x01\xe0" + u16(packet_length) + options
 
 
-def split_nals(data: bytes) -> list[bytes]:
-    starts: list[tuple[int, int]] = []
+def find_nals(data: bytes) -> list[tuple[int, int, int, int]]:
+    """Return (start, header, end, nal_type) without rewriting source bytes."""
+    found: list[tuple[int, int, int, int]] = []
     i = 0
     while i < len(data) - 3:
         if data[i:i + 4] == b"\x00\x00\x00\x01":
-            starts.append((i, i + 4))
+            start, header = i, i + 4
             i += 4
         elif data[i:i + 3] == b"\x00\x00\x01":
-            starts.append((i, i + 3))
+            start, header = i, i + 3
             i += 3
         else:
             i += 1
-    result: list[bytes] = []
-    for n, (_, start) in enumerate(starts):
-        end = starts[n + 1][0] if n + 1 < len(starts) else len(data)
-        nal = data[start:end].rstrip(b"\x00")
-        if nal:
-            result.append(nal)
-    return result
+            continue
+        if header < len(data):
+            found.append((start, header, 0, data[header] & 0x1F))
+    return [
+        (start, header, found[n + 1][0] if n + 1 < len(found) else len(data), nal_type)
+        for n, (start, header, _, nal_type) in enumerate(found)
+    ]
 
 
 def split_access_units(data: bytes) -> list[tuple[bytes, bool]]:
+    """Split on AUD boundaries while preserving every original Annex-B byte."""
+    nals = find_nals(data)
+    if not nals or nals[0][0] != 0:
+        raise ValueError("H.264 stream does not begin with an Annex-B start code")
+
     access_units: list[tuple[bytes, bool]] = []
-    current = bytearray()
-    is_idr = False
-    has_picture = False
-    for nal in split_nals(data):
-        kind = nal[0] & 0x1F
-        # MP4-to-Annex-B conversion can put SPS/PPS/SEI before the first AUD.
-        # Keep those leading parameter sets with the first picture instead of
-        # incorrectly treating them as a non-IDR access unit.
-        if kind == 9 and has_picture:
-            access_units.append((bytes(current), is_idr))
-            current.clear()
-            is_idr = False
-            has_picture = False
-        current += b"\\x00\\x00\\x00\\x01" + nal
+    current_start = nals[0][0]
+    current_is_idr = False
+    current_has_picture = False
+
+    for start, _header, _end, kind in nals:
+        # AUD starts a new picture. Keep SPS/PPS/SEI before the first AUD
+        # attached to frame one, and split only once a picture has begun.
+        if kind == 9 and current_has_picture and start > current_start:
+            access_units.append((data[current_start:start], current_is_idr))
+            current_start = start
+            current_is_idr = False
+            current_has_picture = False
+
         if 1 <= kind <= 5:
-            has_picture = True
+            current_has_picture = True
         if kind == 5:
-            is_idr = True
-    if current and has_picture:
-        access_units.append((bytes(current), is_idr))
+            current_is_idr = True
+
+    if current_has_picture and current_start < len(data):
+        access_units.append((data[current_start:], current_is_idr))
+
     if not access_units or not access_units[0][1]:
         raise ValueError("H.264 elementary stream must begin with an IDR access unit")
     if any(len(au) > 0xFFFF for au, _ in access_units):
         raise ValueError("An H.264 access unit is too large for this PMF index")
     return access_units
+
 
 def private_stream2(frame_sizes: list[int]) -> bytes:
     if not frame_sizes:
@@ -389,6 +397,9 @@ def main() -> None:
             "-bsf:v", "h264_mp4toannexb", "-f", "h264", str(elementary),
         ])
         raw = elementary.read_bytes()
+        # Verify the elementary stream before the custom PMF packer touches it.
+        run([args.ffmpeg, "-v", "error", "-xerror", "-f", "h264",
+             "-i", str(elementary), "-f", "null", "-"])
         access_units = split_access_units(raw)
         pmf_data = mux_video(access_units, 480, 272)
         target.write_bytes(pmf_data)
@@ -404,10 +415,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="lbppsp-pmf-verify-") as temp_dir:
         recovered_path = Path(temp_dir) / "recovered.h264"
         recovered_path.write_bytes(recovered)
-        # The splitter intentionally canonicalizes every NAL start code to
-        # four-byte Annex-B framing and removes only trailing_zero_8bits.
-        # Compare against that exact elementary stream, which is what the
-        # muxer received, rather than the container-extracted raw framing.
+        # The access-unit splitter preserves the original Annex-B byte stream.
         expected_mux_input = b"".join(access_unit for access_unit, _ in access_units)
         if recovered != expected_mux_input:
             raise SystemExit(
