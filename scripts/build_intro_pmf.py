@@ -135,23 +135,29 @@ def split_access_units(data: bytes) -> list[tuple[bytes, bool]]:
     access_units: list[tuple[bytes, bool]] = []
     current = bytearray()
     is_idr = False
+    has_picture = False
     for nal in split_nals(data):
         kind = nal[0] & 0x1F
-        if kind == 9 and current:
+        # MP4-to-Annex-B conversion can put SPS/PPS/SEI before the first AUD.
+        # Keep those leading parameter sets with the first picture instead of
+        # incorrectly treating them as a non-IDR access unit.
+        if kind == 9 and has_picture:
             access_units.append((bytes(current), is_idr))
             current.clear()
             is_idr = False
-        current += b"\x00\x00\x00\x01" + nal
+            has_picture = False
+        current += b"\\x00\\x00\\x00\\x01" + nal
+        if 1 <= kind <= 5:
+            has_picture = True
         if kind == 5:
             is_idr = True
-    if current:
+    if current and has_picture:
         access_units.append((bytes(current), is_idr))
     if not access_units or not access_units[0][1]:
         raise ValueError("H.264 elementary stream must begin with an IDR access unit")
     if any(len(au) > 0xFFFF for au, _ in access_units):
         raise ValueError("An H.264 access unit is too large for this PMF index")
     return access_units
-
 
 def private_stream2(frame_sizes: list[int]) -> bytes:
     if not frame_sizes:
