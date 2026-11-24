@@ -314,7 +314,8 @@ static void pcm_stop(PcmOutput *output)
 }
 
 /* Audio is decoded ahead on its own thread; keep each video frame near its PTS. */
-static int wait_audio(PcmOutput *audio, unsigned int pts)
+static int wait_audio(PcmOutput *audio, unsigned int pts,
+                       unsigned int *previous_buttons)
 {
     unsigned int target;
     if (pts == 0xFFFFFFFFu || pts <= 90000u)
@@ -324,9 +325,14 @@ static int wait_audio(PcmOutput *audio, unsigned int pts)
     while (audio->running && !audio->done &&
            audio->samples_played < target) {
         SceCtrlData pad;
-        sceCtrlPeekBufferPositive(&pad, 1);
-        if (pad.Buttons & PSP_CTRL_CIRCLE)
+        unsigned int pressed;
+        sceCtrlReadBufferPositive(&pad, 1);
+        pressed = pad.Buttons & ~(*previous_buttons);
+        *previous_buttons = pad.Buttons;
+        if (pressed & PSP_CTRL_CIRCLE)
             return -1;
+        if (pressed & PSP_CTRL_CROSS)
+            audio->paused = !audio->paused;
         sceKernelDelayThread(1000);
     }
     return 0;
@@ -482,6 +488,7 @@ static int play_intro(void)
     int ring_size;
     int mpeg_size;
     int idle_polls = 0;
+    unsigned int previous_buttons = 0;
     SceUID file = -1;
     unsigned char header[0x800];
     SceMpeg mpeg = NULL;
@@ -702,7 +709,8 @@ static int play_intro(void)
         int got;
 
         sceCtrlReadBufferPositive(&pad, 1);
-        pressed = pad.Buttons;
+        pressed = pad.Buttons & ~previous_buttons;
+        previous_buttons = pad.Buttons;
         if (pressed & PSP_CTRL_CIRCLE) {
             result = 1;
             break;
@@ -745,7 +753,7 @@ static int play_intro(void)
                 goto cleanup;
             }
             if (decode_status == 1) {
-                if (audio_started && wait_audio(&audio, (unsigned int)au.iPts) < 0) {
+                if (audio_started && wait_audio(&audio, (unsigned int)au.iPts, &previous_buttons) < 0) {
                     result = 1;
                     break;
                 }
