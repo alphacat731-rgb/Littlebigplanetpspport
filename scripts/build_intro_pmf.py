@@ -262,6 +262,32 @@ def mux_video(access_units: list[tuple[bytes, bool]], width: int, height: int) -
     return make_psmf_header(len(sectors), len(access_units), width, height) + bytes(sectors)
 
 
+
+def extract_h264_from_psmf(data: bytes) -> bytes:
+    if len(data) < 0x800 or data[:8] != b"PSMF0014":
+        raise ValueError("Cannot extract AVC from a non-PSMF file")
+    stream = data[0x800:]
+    if len(stream) % SECTOR:
+        raise ValueError("PSMF stream is not sector aligned")
+    recovered = bytearray()
+    for sector_number, offset in enumerate(range(0, len(stream), SECTOR)):
+        sector = stream[offset:offset + SECTOR]
+        if sector[:4] != b"\x00\x00\x01\xba":
+            raise ValueError(f"Missing pack header in sector {sector_number}")
+        body = sector[14:]
+        pes = body.find(b"\x00\x00\x01\xe0")
+        if pes < 0 or pes + 9 > len(body):
+            raise ValueError(f"No complete video PES in sector {sector_number}")
+        packet_length = int.from_bytes(body[pes + 4:pes + 6], "big")
+        header_data_length = body[pes + 8]
+        payload_length = packet_length - 3 - header_data_length
+        payload_start = pes + 9 + header_data_length
+        payload_end = payload_start + payload_length
+        if payload_length <= 0 or payload_end > len(body):
+            raise ValueError(f"Invalid video PES payload length in sector {sector_number}")
+        recovered += body[payload_start:payload_end]
+    return bytes(recovered)
+
 def validate_psmf(path: Path, access_units: list[tuple[bytes, bool]], width: int, height: int) -> None:
     data = path.read_bytes()
     if len(data) < 0x800 + SECTOR or data[:8] != b"PSMF0014":
@@ -374,11 +400,28 @@ def main() -> None:
         "-ar", "44100", "-ac", "2", "-c:a", "pcm_s16le",
         "-f", "s16le", str(audio_target),
     ])
-    details = probe(target, args.ffprobe)
-    pmf_video = next((s for s in details.get("streams", []) if s.get("codec_type") == "video"), None)
-    if not pmf_video or pmf_video.get("codec_name") != "h264" or (pmf_video.get("width"), pmf_video.get("height")) != (480, 272):
-        raise SystemExit(f"Generated PMF does not decode as 480x272 H.264: {details}")
-    run([args.ffmpeg, "-v", "error", "-xerror", "-i", str(target), "-an", "-f", "null", "-"])
+    recovered = extract_h264_from_psmf(target.read_bytes())
+    with tempfile.TemporaryDirectory(prefix="lbppsp-pmf-verify-") as temp_dir:
+        recovered_path = Path(temp_dir) / "recovered.h264"
+        recovered_path.write_bytes(recovered)
+        original_probe = subprocess.run(
+            [args.ffprobe, "-v", "error", "-show_entries",
+             "stream=codec_name,profile,width,height,pix_fmt", "-of", "json", str(recovered_path)],
+            check=True, capture_output=True, text=True,
+        )
+        recovered_info = json.loads(original_probe.stdout)
+        recovered_video = next((s for s in recovered_info.get("streams", [])
+                                if s.get("codec_name") == "h264"), None)
+        if not recovered_video or (recovered_video.get("width"), recovered_video.get("height")) != (480, 272):
+            raise SystemExit(f"Recovered PMF payload is not 480x272 H.264: {recovered_info}")
+        # The PMF must contain exactly the stream that was muxed, with no lost,
+        # duplicated, or altered bytes across PES and 2048-byte pack boundaries.
+        if recovered != raw:
+            raise SystemExit(
+                f"PMF H.264 payload changed during muxing: input={len(raw)} recovered={len(recovered)} bytes"
+            )
+        run([args.ffmpeg, "-v", "error", "-xerror", "-f", "h264",
+             "-i", str(recovered_path), "-f", "null", "-"])
     if not audio_target.is_file() or audio_target.stat().st_size == 0 or audio_target.stat().st_size % 4:
         raise SystemExit("PCM audio is missing, empty, or not stereo 16-bit aligned")
 
