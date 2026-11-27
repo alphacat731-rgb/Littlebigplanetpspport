@@ -26,9 +26,9 @@ The clean MP4 is included in the workflow artifact for inspection. It is a build
 
 ## Player implementation
 
-The AVC decoder uses the PSP's low-resolution hardware path for this 480x272 video. It queries MPEG memory with mode 4, creates a 4 MiB-aligned 2 MiB Media Engine workspace, passes that workspace to sceMpegCreate, and places the AVC access-unit buffer at workspace + 0x10000. The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels, following the established PMPlayer Advance initialization pattern.
+The AVC decoder uses the PSP's low-resolution hardware path for this 480x272 video. It queries MPEG memory with mode 4, creates a 4 MiB-aligned 2 MiB Media Engine workspace, passes that workspace to sceMpegCreate, and places the AVC access-unit buffer at workspace + 0x10000. The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels, following the established PMPlayer Advance initialization pattern. The workspace is retained for the lifetime of the app instead of being returned to the heap during player teardown. The MPEG ringbuffer uses 512 sectors to reduce starvation while the decoder is assembling access units.
 
-Decoded YCbCr planes are obtained with sceMpegAvcDecodeDetail2 and converted to the 8888 texture through sceMpegBaseCscAvc. The player keeps the converted texture in aligned main RAM, handles cache coherency before GU upload, and records detailed playback diagnostics. The PPSSPP-only direct-output fallback is used only if its HLE rejects the hardware-style NULL output argument.
+Decoded YCbCr planes are obtained with sceMpegAvcDecodeDetail2 and converted to the 8888 texture through sceMpegBaseCscAvc. The player keeps the converted texture in aligned main RAM, handles cache coherency before GU upload, and records detailed playback diagnostics. The PPSSPP-only direct-output fallback is used only if its HLE rejects the hardware-style NULL output argument. The PSMF muxer marks every GOP access-unit index entry, including each GOP's final entry, with the Sony-style 0x0080 flag and validates those flags before packaging.
 
 Technical references used to verify the playback approach:
 - PSPSDK MPEG API: https://github.com/pspdev/pspsdk/blob/master/src/mpeg/pspmpeg.h
