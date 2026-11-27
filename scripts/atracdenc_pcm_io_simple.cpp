@@ -44,7 +44,7 @@ static uint32_t fourcc(const char* s) {
 class SimpleWav : public IPCMProviderImpl {
 public:
     explicit SimpleWav(const std::string& path)
-        : file_(path, std::ios::binary), channels_(0), rate_(0), total_(0),
+        : file_(path, std::ios::binary | std::ios::in), channels_(0), rate_(0), total_(0),
           data_left_(0), write_mode_(false) {
         if (!file_) throw std::runtime_error("cannot open WAV input: " + path);
         char magic[4];
