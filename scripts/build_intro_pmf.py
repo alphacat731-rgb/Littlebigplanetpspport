@@ -174,8 +174,10 @@ def private_stream2(frame_sizes: list[int]) -> bytes:
     payload = bytearray(bytes.fromhex("01e0000400040005000600000000"))
     payload += u16(2 + 4 * len(frame_sizes))
     payload += u16(len(frame_sizes))
-    for index, size in enumerate(frame_sizes):
-        payload += u16(0x0000 if index == len(frame_sizes) - 1 else 0x0080)
+    for size in frame_sizes:
+        # Match the PSPRelay / Sony-style PSMF GOP index: every AU entry,
+        # including the final entry in a GOP, carries the 0x0080 flag.
+        payload += u16(0x0080)
         payload += u16(size)
     if len(payload) > 0xFFFF:
         raise ValueError("GOP index packet exceeds the MPEG-2 packet length limit")
@@ -349,9 +351,12 @@ def validate_psmf(path: Path, access_units: list[tuple[bytes, bool]], width: int
     table_size = int.from_bytes(index_data[14:16], "big")
     next_idr = next((i for i in range(1, len(access_units)) if access_units[i][1]), len(access_units))
     expected_sizes = [len(access_units[i][0]) for i in range(next_idr)]
+    indexed_flags = [int.from_bytes(index_data[18 + 4 * i:20 + 4 * i], "big") for i in range(count)]
     indexed_sizes = [int.from_bytes(index_data[20 + 4 * i:22 + 4 * i], "big") for i in range(count)]
     if count != len(expected_sizes) or table_size != 2 + 4 * count or indexed_sizes != expected_sizes:
         raise ValueError("First GOP index does not match its H.264 access units")
+    if indexed_flags != [0x0080] * count:
+        raise ValueError("First GOP index must mark every access unit with the Sony 0x0080 flag")
 
     pes_pos = index_pos + 6 + index_length
     if first[pes_pos:pes_pos + 4] != b"\x00\x00\x01\xe0":
