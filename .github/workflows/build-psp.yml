@@ -1,4 +1,4 @@
-name: Rebuild LBPPSP Alpha
+name: Rebuild LBPPSP2008
 
 on:
   push:
@@ -52,7 +52,16 @@ jobs:
             --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
             --output "build/LBPPSP_ALPHA_INTRO_SOURCE.mp4"
 
-      - name: Validate fresh MP4 and presentation assets
+      - name: Build the actual full-screen XMB background
+        run: |
+          mkdir -p build
+          ffmpeg -hide_banner -loglevel error -y \
+            -i "LBPPSP_Alpha_PIC1.png" \
+            -vf "scale=480:272:flags=lanczos,format=rgba" \
+            -frames:v 1 "build/LBPPSP2008_PIC1.png"
+          test "$(identify -format '%wx%h' build/LBPPSP2008_PIC1.png)" = "480x272"
+
+      - name: Validate fresh MP4 and XMB presentation assets
         run: python scripts/validate_assets.py --ffprobe ffprobe
 
       - name: Build Sony-layout PSMF video and synchronized PCM audio
@@ -96,22 +105,27 @@ jobs:
 
       - name: Assemble Memory Stick layout
         run: |
-          mkdir -p dist/PSP/GAME/LBPPSP_ALPHA
-          cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
-          cp build/LBPPSP_ALPHA_INTRO.PMF dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF
-          cp build/LBPPSP_ALPHA_INTRO.PCM dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
-          cp build/LOADING.RGBA dist/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA
+          mkdir -p dist/PSP/GAME/LBPPSP2008
+          cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP2008/EBOOT.PBP
+          cp build/LBPPSP_ALPHA_INTRO.PMF dist/PSP/GAME/LBPPSP2008/INTRO.PMF
+          cp build/LBPPSP_ALPHA_INTRO.PCM dist/PSP/GAME/LBPPSP2008/INTRO.PCM
+          cp build/LOADING.RGBA dist/PSP/GAME/LBPPSP2008/LOADING.RGBA
           cat > dist/README.txt <<'EOF2'
-          LBPPSP Alpha - PSP homebrew prototype build
+          LBPPSP2008 - PSP homebrew prototype build
 
           Copy the PSP folder to the root of the Memory Stick.
-          Start the application under Game > Memory Stick.
+          Launch Game > Memory Stick > LBPPSP2008.
 
           Startup sequence:
           1. Loading image for 3 seconds.
           2. Black screen for 2 seconds.
-          3. Intro video and soundtrack start automatically.
+          3. The new intro video and soundtrack start automatically.
           4. The prototype menu appears after playback.
+
+          The XMB title is LBPPSP2008. ICON0.PNG is the new custom icon.
+          PIC0.PNG is intentionally omitted so it cannot cover the XMB
+          background. PIC1.PNG is the supplied background at 480x272.
+          The loading image is only used inside the application's startup.
 
           X pauses/resumes the soundtrack clock. O stops playback.
           Keep INTRO.PMF, INTRO.PCM and LOADING.RGBA beside EBOOT.PBP.
@@ -121,26 +135,28 @@ jobs:
           This is a bootable homebrew prototype shell, not the original
           LittleBigPlanet game or its gameplay source code.
           EOF2
-          zip -qr LBPPSP_ALPHA_build.zip dist
+          zip -qr LBPPSP2008_build.zip dist
 
       - name: Verify final install archive
         run: |
-          unzip -t LBPPSP_ALPHA_build.zip
-          test -s dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
-          test -s dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF
-          test -s dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
-          test -s dist/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA
+          unzip -t LBPPSP2008_build.zip
+          test -s dist/PSP/GAME/LBPPSP2008/EBOOT.PBP
+          test -s dist/PSP/GAME/LBPPSP2008/INTRO.PMF
+          test -s dist/PSP/GAME/LBPPSP2008/INTRO.PCM
+          test -s dist/PSP/GAME/LBPPSP2008/LOADING.RGBA
 
       - name: Upload rebuilt PSP package and clean MP4
         uses: actions/upload-artifact@v4
         with:
-          name: LBPPSP-Alpha-rebuilt-clean-MP4
+          name: LBPPSP2008-fixed-player-clean-video
           path: |
-            LBPPSP_ALPHA_build.zip
+            LBPPSP2008_build.zip
             build/LBPPSP_ALPHA_INTRO_SOURCE.mp4
             build/LBPPSP_ALPHA_INTRO.PMF
             build/LBPPSP_ALPHA_INTRO.PCM
             build/LOADING.RGBA
+            build/LBPPSP2008_PIC1.png
+            LBPPSP2008_ICON0.png
             psp/EBOOT.PBP
           if-no-files-found: error
           retention-days: 14
