@@ -17,12 +17,13 @@
 
 PSP_MODULE_INFO("LBPPSP Alpha", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
-PSP_MAIN_THREAD_STACK_SIZE_KB(64);
+PSP_MAIN_THREAD_STACK_SIZE_KB(128);
+PSP_HEAP_SIZE_KB(-2048);
 
 #define W 480
 #define H 272
 #define FBW 512
-#define PACKETS 32
+#define PACKETS 512
 #define MPEG_MODE 4
 #define DDRTOP_SIZE 0x200000
 #define DDRTOP_ALIGN 0x400000
@@ -99,6 +100,8 @@ extern SceInt32 sceMpegBaseCscAvc(ScePVoid rgb_buffer, SceInt32 unknown,
 static unsigned int __attribute__((aligned(16))) gu_list[8192];
 static const char *last_playback_stage = "not started";
 static int last_playback_error = 0;
+/* Keep the 4 MiB-aligned Media Engine workspace alive for the app lifetime. */
+static void *g_ddrtop_workspace = NULL;
 
 static int exit_callback(int a, int b, void *c)
 {
@@ -505,7 +508,12 @@ static int play_intro(void)
     rb_mem = memalign(64, rb_size);
     mpeg_mem = memalign(64, mpeg_size);
     /* sceMpegCreate requires a 4 MiB-aligned, 2 MiB Media Engine workspace. */
-    ddrtop = memalign(DDRTOP_ALIGN, DDRTOP_SIZE);
+    if (!g_ddrtop_workspace) {
+        g_ddrtop_workspace = memalign(DDRTOP_ALIGN, DDRTOP_SIZE);
+        if (g_ddrtop_workspace)
+            memset(g_ddrtop_workspace, 0, DDRTOP_SIZE);
+    }
+    ddrtop = g_ddrtop_workspace;
     /* The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels. */
     au_mem = memalign(64, 64);
     last_playback_stage = "Allocating MPEG memory";
@@ -869,7 +877,7 @@ cleanup:
     if (avcodec) sceUtilityUnloadAvModule(PSP_AV_MODULE_AVCODEC);
     if (rb_mem) free(rb_mem);
     if (mpeg_mem) free(mpeg_mem);
-    if (ddrtop) free(ddrtop);
+    /* g_ddrtop_workspace is intentionally retained until process exit. */
     if (frame) free(frame);
     if (decode_buffer) free(decode_buffer);
     if (file >= 0) sceIoClose(file);
