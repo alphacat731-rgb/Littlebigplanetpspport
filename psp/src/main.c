@@ -17,7 +17,7 @@
 
 PSP_MODULE_INFO("LBPPSP Alpha", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
-PSP_MAIN_THREAD_STACK_SIZE_KB(128);
+PSP_MAIN_THREAD_STACK_SIZE_KB(512);
 PSP_HEAP_SIZE_KB(-2048);
 
 #define W 480
@@ -562,6 +562,17 @@ static int play_intro(void)
     mpeg_ready = 1;
     playback_log("sceMpegCreate mode 0 succeeded");
 
+    mode.iUnk0 = -1;
+    mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
+    last_playback_stage = "Setting AVC decode mode";
+    {
+        int ret = sceMpegAvcDecodeMode(&mpeg, &mode);
+        if (ret < 0) {
+            set_playback_failure("Setting AVC decode mode", ret);
+            goto cleanup;
+        }
+    }
+
     last_playback_stage = "Reading PMF stream metadata";
     {
         int ret = sceMpegQueryStreamOffset(&mpeg, header, &offset);
@@ -620,17 +631,6 @@ static int play_intro(void)
         int ret = sceMpegInitAu(&mpeg, au_es, au);
         if (ret < 0) {
             set_playback_failure("Initializing AVC access unit", ret);
-            goto cleanup;
-        }
-    }
-
-    mode.iUnk0 = -1;
-    mode.iPixelFormat = SCE_MPEG_AVC_FORMAT_8888;
-    last_playback_stage = "Setting AVC decode mode";
-    {
-        int ret = sceMpegAvcDecodeMode(&mpeg, &mode);
-        if (ret < 0) {
-            set_playback_failure("Setting AVC decode mode", ret);
             goto cleanup;
         }
     }
