@@ -21,5 +21,7 @@ mkdir -p "$(dirname "$OUT")"
 cp "$SRC/build/src/atracdenc" "$OUT"
 chmod +x "$OUT"
 cp "$SRC/LICENSE" "${OUT}.LICENSE"
+tar -czf "${OUT}-source.tar.gz" --exclude=./.git --exclude=./build -C "$SRC" .
 printf 'Built patched ATRACDEnc %s with 744-byte ATRAC3+ frame-size support.\n' "$COMMIT"
 printf 'Binary: %s\n' "$OUT"
+printf 'Patched source bundle: %s-source.tar.gz\n' "$OUT"
