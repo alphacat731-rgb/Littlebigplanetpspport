@@ -17,7 +17,7 @@
 
 PSP_MODULE_INFO("LBPPSP Alpha", 0, 1, 0);
 PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
-PSP_MAIN_THREAD_STACK_SIZE_KB(512);
+PSP_MAIN_THREAD_STACK_SIZE_KB(128);
 PSP_HEAP_SIZE_KB(-2048);
 
 #define W 480
@@ -28,10 +28,8 @@ PSP_HEAP_SIZE_KB(-2048);
 #define SECTOR 2048
 /* sceMpegGetAvcAu returns this while the ringbuffer has no complete AU yet. */
 #define LBP_MPEG_ERROR_NOT_COMPLETED 0x80618001u
-#define PCM_SAMPLES 512
-#define PCM_BYTES (PCM_SAMPLES * 2 * sizeof(short))
+#define AUDIO_BUFS 4
 #define PMF_PATH "ms0:/PSP/GAME/LBPPSP2008/INTRO.PMF"
-#define PCM_PATH "ms0:/PSP/GAME/LBPPSP2008/INTRO.PCM"
 #define LOG_PATH "ms0:/PSP/GAME/LBPPSP2008/PLAYBACK.LOG"
 #define ROOT_LOG_PATH "ms0:/PLAYBACK.LOG"
 #define DRAW_BYTES (FBW * H * 4)
@@ -46,16 +44,24 @@ typedef struct {
 } PmfInput;
 
 typedef struct {
-    SceUID file;
     SceUID thread;
+    SceUID lock;
     int channel;
-    volatile int running;
-    volatile int paused;
+    int volume;
     volatile int done;
+    volatile int paused;
     volatile int error;
-    volatile unsigned int samples_played;
-    void *buffer;
-} PcmOutput;
+    int output_size;
+    void *buffers[AUDIO_BUFS];
+    int head;
+    int tail;
+    int count;
+} AtracOutput;
+
+/* Small ATRAC3+ buffers are retained for the app lifetime because the PSP
+   audio DMA may still be reading the last submitted buffer. */
+static void *g_atrac_output_buffers[AUDIO_BUFS] = { NULL, NULL, NULL, NULL };
+static int g_atrac_output_size = 0;
 
 typedef struct {
     short u, v, x, y, z;
