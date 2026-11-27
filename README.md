@@ -1,69 +1,86 @@
 # LBPPSP2008
 
-This repository builds a bootable PSP homebrew prototype with an automatic startup sequence and an in-game intro-video player.
+A bootable PSP homebrew prototype shell with automatic startup, an intro movie player, and the supplied XMB presentation assets.
 
 ## Automatic startup
 
-1. The loading-screen image is shown for 3 seconds.
-2. The screen holds black for 2 seconds.
-3. The intro video starts automatically, with its soundtrack.
-4. The prototype menu appears after the intro ends.
+1. Show the loading image for 3 seconds.
+2. Hold a black screen for 2 seconds.
+3. Start the intro movie and soundtrack automatically.
+4. Show the prototype menu when both movie streams finish.
 
-During playback, X pauses or resumes the soundtrack clock and O stops the intro and returns to the menu. The D-pad selects menu items.
+During playback, X pauses/resumes playback and O stops the movie. The D-pad selects menu items.
 
-## Rebuilt media pipeline
+## PSP movie format
 
-The repository's original video input is a VP9/Opus file carrying an MP4 suffix. The build no longer feeds that mismatched container directly into the PMF muxer.
+The PSP's `sceMpeg` movie player expects Sony's PSMF/PMF container. A plain MP4 is a conversion source, not the file that `sceMpeg` plays.
 
-GitHub Actions now:
-1. Decodes the original source and writes a fresh MP4 with H.264 Constrained Baseline video (480x272, yuv420p, no B-frames) and AAC stereo audio (44.1 kHz).
-2. Fully decodes both streams and validates the new MP4 before accepting it.
-3. Copies the validated H.264 stream into a Sony PSMF/PMF video container with 2048-byte MPEG packs, GOP access-unit indexes, and PSMF header/stream descriptors.
-4. Extracts the fresh AAC soundtrack to 44.1 kHz stereo PCM for the homebrew audio thread.
-5. Compiles the PSP executable from a clean PSPSDK build and assembles the Memory Stick package.
+The new pipeline creates a single multiplexed PSMF movie containing:
 
-The clean MP4 is included in the workflow artifact for inspection. It is a build input, not the file the PSP plays. PSP sceMpeg playback uses the PMF container, not a plain MP4. The installed folder contains INTRO.PMF, INTRO.PCM, and LOADING.RGBA.
+- AVC/H.264 video on stream `0xE0`, 480x272, 29.97 fps, Main profile, yuv420p, no B-frames, fixed 48-frame GOPs, one reference frame, bounded video bitrate.
+- ATRAC3+ audio on stream `0xBD`, 44.1 kHz stereo, 128 kbit/s retail frame size (744-byte codec frames).
+- Sony-style 2048-byte MPEG packs, PSMF stream descriptors, video GOP access-unit indexes, audio PES timestamps, and ATRAC3+ frame wrappers.
 
-## Player implementation
+There is no separate PCM sidecar. The soundtrack is inside `INTRO.PMF`.
 
-The video player now follows the conventional sceMpeg path used by PSPRelay, which reports testing on a PSP-2000 running ARK-5 6.61 and in PPSSPP. It uses sceMpegQueryMemSize(0), sceMpegCreate(..., 512, 0, 0), sceMpegMallocAvcEsBuf, and sceMpegInitAu. The decoded frame is placed in eDRAM immediately after the GU draw and display buffers. sceMpegAvcDecode receives the output-buffer pointer by double indirection (&frame), matching the PSP hardware ABI used by the reference player. The previous experimental DDR-top / NULL output / custom CSC implementation has been removed. The MPEG ringbuffer uses 512 sectors.
+## ATRAC3+ encoder
 
-The fresh MP4 encoder uses 480x272, yuv420p, 29.97 fps, Constrained Baseline, no B-frames, a 30-frame GOP, and a bounded 768 kbit/s video bitrate. The PMF builder rejects GOP indexes over Sony's 59-access-unit limit and marks each entry with the 0x0080 flag.
+Upstream ATRACDEnc defaults to 2048-byte ATRAC3+ frames, which is not the retail-rate frame size used by this PSP movie. The build therefore pins ATRACDEnc commit `cb170709f836cb43dc0312455188c791159d81dc` and applies `scripts/atracdenc-744.patch`. The patch exposes the existing encoder frame-size setting through `AT3P_FRAME`; the build sets it to 744 bytes.
 
-XMB resources are deliberately separated: ICON0.PNG is the supplied 144x80 game icon; PIC0.PNG is omitted so no information overlay can cover the background; PIC1.PNG is the supplied wallpaper scaled to exactly 480x272. The loading artwork is only converted to LOADING.RGBA and shown during the application's three-second startup splash.
+The build script is `scripts/build_atracdenc.sh`. ATRACDEnc is LGPL-2.1-or-later and its license is copied alongside the built encoder in the CI artifact. The patch is included in this repository for reproducibility.
 
-Technical references used to verify the playback approach:
-- PSPSDK MPEG API: https://github.com/pspdev/pspsdk/blob/master/src/mpeg/pspmpeg.h
-- PPSSPP MPEG/PSMF internals: https://www.ppsspp.org/docs/development/ppsspp-internals/mpeg/
-- PSPRelay PSP/PPSSPP H.264 player: https://github.com/SarahRoseLives/PSPRelay
+The PSMF builder is `scripts/build_intro_psmf.py`. It re-encodes the video as a PSP-oriented H.264 elementary stream, prepares 44.1 kHz stereo PCM for ATRACDEnc, creates the retail-rate ATRAC3+ frames, and multiplexes both tracks into a PSMF file. It then extracts both tracks again, checks that their payloads are byte-identical to the mux inputs, and fully decodes the recovered H.264 and ATRAC3+ tracks with FFmpeg before accepting the movie.
 
-## Install on PSP or PPSSPP
+## PSP decoder
 
-Download LBPPSP2008_build.zip from the successful GitHub Actions artifact. Extract it and copy its dist/PSP folder to the root of the Memory Stick.
+The player uses the standard `sceMpeg` mode-0 pipeline used by PSPRelay:
 
-The final layout must be:
+- `sceMpegQueryMemSize(0)` and `sceMpegCreate(..., 512, 0, 0)`.
+- AVC elementary-stream allocation through `sceMpegMallocAvcEsBuf`.
+- Separate registrations for AVC stream 0 and ATRAC3+ stream 1.
+- ATRAC3+ decoder buffer sizing through `sceMpegQueryAtracEsSize`, then `sceMpegGetAtracAu` and `sceMpegAtracDecode`.
+- Four 64-byte-aligned audio output buffers, consumed on a separate audio thread.
+- AVC decoding with `sceMpegGetAvcAu` and `sceMpegAvcDecode`, with the decoded frame written to eDRAM.
+
+The player uses a 512-sector ringbuffer and a 128 KiB main thread stack. The four ATRAC output buffers are small and retained for the app lifetime because the audio DMA may still be reading the last submitted buffer.
+
+PSPRelay documents tests on a PSP-2000 running ARK-5 6.61 and in PPSSPP. This project targets a PSP-1000 (model 1004), which has less system memory; the smaller stack and bounded queue reduce its memory footprint. This does not substitute for an actual PSP-1000 runtime test.
+
+## XMB presentation
+
+- XMB title: `LBPPSP2008`.
+- `ICON0.PNG`: supplied custom icon at 144x80.
+- `PIC0.PNG`: intentionally empty so an information overlay cannot cover the wallpaper.
+- `PIC1.PNG`: supplied full-screen wallpaper at 480x272.
+- The loading artwork is only converted to `LOADING.RGBA` and shown inside the application during startup.
+
+## Install
+
+Download `LBPPSP2008_build.zip` from the successful GitHub Actions artifact and extract its `PSP` folder to the root of the Memory Stick.
+
+The game directory is:
 
     ms0:/PSP/GAME/LBPPSP2008/
         EBOOT.PBP
         INTRO.PMF
-        INTRO.PCM
         LOADING.RGBA
 
-Launch it under Game > Memory Stick.
+Launch `LBPPSP2008` under Game > Memory Stick.
 
-If playback fails, retrieve PLAYBACK.LOG from the game folder. A fallback log is also written to ms0:/PLAYBACK.LOG.
-
-## Project scope
-
-This repository currently contains the bootable homebrew shell, menu, video playback code, and media/presentation assets. It does not contain the original LittleBigPlanet PSP source code or its complete gameplay systems, so this build is a bootable prototype foundation rather than a rebuilt copy of the original game.
+If playback fails, retrieve `PLAYBACK.LOG` from the game folder. A fallback is written to `ms0:/PLAYBACK.LOG`.
 
 ## Local build
 
-The media pipeline requires FFmpeg and Python 3.12. The PSP executable requires Docker and the PSPSDK image:
+Dependencies: FFmpeg, FFprobe, Python 3.12, CMake, a C/C++ toolchain, libsndfile development headers, Docker, and the PSPSDK Docker image.
 
     python scripts/prepare_intro_mp4.py
     python scripts/validate_assets.py
-    python scripts/build_intro_pmf.py --input build/LBPPSP2008_INTRO_SOURCE.mp4 --output build/LBPPSP2008_INTRO.PMF --audio-output build/LBPPSP2008_INTRO.PCM
+    scripts/build_atracdenc.sh build/atracdenc
+    python scripts/build_intro_psmf.py --input build/LBPPSP_ALPHA_INTRO_SOURCE.mp4 --encoder build/atracdenc --output build/INTRO.PMF --test-at3-output build/ATRAC3P_TEST.at3
     docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make clean
     docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make
     python scripts/validate_pbp.py psp/EBOOT.PBP
+
+## Project scope
+
+This repository contains the bootable homebrew shell, menu, video player, and media/presentation pipeline. It does not contain the original LittleBigPlanet PSP gameplay source or full game engine, so this is a bootable prototype foundation rather than a reconstruction of the original commercial game.
