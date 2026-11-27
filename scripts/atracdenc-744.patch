@@ -1,0 +1,24 @@
+# ATRACDEnc 0.2.3 frame-size hook for PSP retail-rate ATRAC3+.
+# Adapted from the LGPL-2.1-or-later patch documented in:
+# https://github.com/JamesAZ0/RockmanDASH-PSP-English-Patcher
+# src/atracdenc/at3p_frame.patch
+# It exposes the existing BitStream frame-size parameter through AT3P_FRAME.
+--- a/src/atrac/at3p/at3p.cpp
++++ b/src/atrac/at3p/at3p.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include <cassert>
+ #include <vector>
++#include <cstdlib>
+ #include <unordered_map>
+ 
+ using std::vector;
+@@ -37,7 +38,7 @@
+ class TAt3PEnc::TImpl {
+ public:
+     TImpl(ICompressedOutput* out, int channels, TSettings settings)
+-        : BitStream(out, 2048)
++        : BitStream(out, getenv("AT3P_FRAME") ? (uint16_t)atoi(getenv("AT3P_FRAME")) : 2048)
+         , ChannelCtx(channels)
+         , GhaProcessor(MakeGhaProcessor0(channels == 2, settings.UseGha & TSettings::GHA_WIDEBAND, settings.WidebandRefineMode))
+         , Settings(settings)

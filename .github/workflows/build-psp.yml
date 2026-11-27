@@ -1,4 +1,4 @@
-name: Build LBPPSP Alpha
+name: Rebuild LBPPSP2008
 
 on:
   push:
@@ -12,9 +12,9 @@ permissions:
 
 jobs:
   build:
-    name: Convert in-game cutscene and build PSP EBOOT
+    name: Build ATRAC3+ PMF, compile PSP EBOOT and package
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 60
 
     steps:
       - name: Check out source
@@ -25,29 +25,69 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install FFmpeg
+      - name: Install media and ATRAC3+ encoder dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg cmake build-essential
 
-      - name: Validate source assets
+      - name: Validate repository video source
+        run: |
+          test -s "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4"
+          python - <<'PY'
+          import subprocess, json
+          source = "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4"
+          result = subprocess.run(
+              ["ffprobe", "-v", "error", "-show_entries",
+               "stream=codec_type,codec_name", "-of", "json", source],
+              check=True, capture_output=True, text=True)
+          streams = json.loads(result.stdout)["streams"]
+          assert any(s["codec_type"] == "video" for s in streams), streams
+          assert any(s["codec_type"] == "audio" for s in streams), streams
+          print("Repository video source contains video and audio streams.")
+          PY
+
+      - name: Create a clean intermediate MP4
+        run: |
+          python scripts/prepare_intro_mp4.py \
+            --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
+            --output "build/LBPPSP_ALPHA_INTRO_SOURCE.mp4"
+
+      - name: Build the actual full-screen XMB background
+        run: |
+          mkdir -p build
+          ffmpeg -hide_banner -loglevel error -y \
+            -i "LBPPSP_Alpha_PIC1.png" \
+            -vf "scale=480:272:flags=lanczos,format=rgba" \
+            -frames:v 1 "build/LBPPSP2008_PIC1.png"
+          test "$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 build/LBPPSP2008_PIC1.png)" = "480x272"
+
+      - name: Validate intermediate media and XMB assets
         run: python scripts/validate_assets.py --ffprobe ffprobe
 
-      - name: Build in-game PMF video and synchronized PCM audio
+      - name: Build patched ATRACDEnc with PSP 744-byte frames
         run: |
-          python scripts/build_intro_pmf.py \
-            --input "LBPPSP_Alpha_Video_01_tut_vo.mp4.240p.vp9.mp4" \
-            --output "build/LBPPSP_ALPHA_INTRO.PMF" \
-            --audio-output "build/LBPPSP_ALPHA_INTRO.PCM"
+          chmod +x scripts/build_atracdenc.sh
+          scripts/build_atracdenc.sh build/atracdenc
+          test -s build/atracdenc
+          test -s build/atracdenc.LICENSE
 
-      - name: Convert loading screen PNG to PSP texture
+      - name: Build multiplexed AVC + ATRAC3+ PSMF
+        run: |
+          python scripts/build_intro_psmf.py \
+            --input "build/LBPPSP_ALPHA_INTRO_SOURCE.mp4" \
+            --encoder "build/atracdenc" \
+            --output "build/INTRO.PMF" \
+            --test-at3-output "build/ATRAC3P_TEST.at3"
+          test -s build/INTRO.PMF
+          test -s build/ATRAC3P_TEST.at3
+
+      - name: Convert in-app loading screen to PSP texture
         run: |
           ffmpeg -hide_banner -loglevel error -y \
             -i "LBPPSP_Alpha_LoadingScreen.png" \
             -vf "scale=480:272:flags=lanczos,format=rgba,pad=512:512:0:0:color=black" \
             -frames:v 1 -pix_fmt rgba -f rawvideo "build/LOADING.RGBA"
           test "$(stat -c%s build/LOADING.RGBA)" -eq 1048576
-
 
       - name: Clean PSP build
         run: |
@@ -59,54 +99,79 @@ jobs:
 
       - name: Compile and package EBOOT.PBP
         run: |
+          set -o pipefail
           docker run --rm \
             -v "$GITHUB_WORKSPACE:/workspace" \
             -w /workspace/psp \
             pspdev/pspdev:latest make 2>&1 | tee build/psp-build.log
           if grep -q "could not fixup imports" build/psp-build.log; then
-            echo "PSPSDK import table fixup failed; refusing to package this EBOOT."
+            echo "PSPSDK import-table fixup failed; refusing to package this EBOOT."
             exit 1
           fi
 
-      - name: Validate bootable PBP structure
+      - name: Validate PBP title and XMB presentation resources
         run: python scripts/validate_pbp.py psp/EBOOT.PBP
 
-      - name: Assemble Memory Stick layout
+      - name: Assemble LBPPSP2008 Memory Stick layout
         run: |
-          mkdir -p dist/PSP/GAME/LBPPSP_ALPHA
-          cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP_ALPHA/EBOOT.PBP
-          cp build/LBPPSP_ALPHA_INTRO.PMF dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF
-          cp build/LBPPSP_ALPHA_INTRO.PCM dist/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM
-          cp build/LOADING.RGBA dist/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA
+          mkdir -p dist/PSP/GAME/LBPPSP2008
+          cp psp/EBOOT.PBP dist/PSP/GAME/LBPPSP2008/EBOOT.PBP
+          cp build/INTRO.PMF dist/PSP/GAME/LBPPSP2008/INTRO.PMF
+          cp build/LOADING.RGBA dist/PSP/GAME/LBPPSP2008/LOADING.RGBA
           cat > dist/README.txt <<'EOF2'
-          LBPPSP Alpha - PSP homebrew build
+          LBPPSP2008 - PSP homebrew prototype build
 
           Copy the PSP folder to the root of the Memory Stick.
-          Start the application under Game > Memory Stick.
+          Launch Game > Memory Stick > LBPPSP2008.
 
-          On launch: the loading-screen image appears for 3 seconds, then
-          the screen stays black for 2 seconds, then the intro starts automatically.
-          X pauses/resumes the cutscene. O stops playback and opens the menu.
+          Startup sequence:
+          1. Loading image for 3 seconds.
+          2. Black screen for 2 seconds.
+          3. Multiplexed H.264 + ATRAC3+ intro starts automatically.
+          4. The prototype menu appears after playback.
 
-          Keep INTRO.PMF, INTRO.PCM and LOADING.RGBA beside EBOOT.PBP.
-          INTRO.PMF contains the H.264 video; INTRO.PCM is its synchronized
-          44.1 kHz stereo soundtrack. LOADING.RGBA is the 512x512 PSP texture
-          generated from the repository's loading-screen PNG.
+          INTRO.PMF contains both the AVC video stream and the ATRAC3+
+          soundtrack. No separate PCM sidecar is required.
+          The XMB title is LBPPSP2008. ICON0.PNG is the supplied custom
+          icon. PIC0.PNG is intentionally empty. PIC1.PNG is the supplied
+          wallpaper scaled to the PSP's 480x272 display.
+          The loading image is only shown inside the application.
 
-          This is still a bootable prototype shell, not the complete original
-          LittleBigPlanet game or its original gameplay systems.
+          X pauses/resumes playback. O stops playback.
+          PLAYBACK.LOG is written in this folder; a fallback is written to
+          the Memory Stick root if the game-folder log cannot be opened.
+
+          This is a bootable homebrew prototype shell, not the original
+          LittleBigPlanet game or its gameplay source code.
           EOF2
-          zip -qr LBPPSP_ALPHA_build.zip dist
+          zip -qr LBPPSP2008_build.zip dist
 
-      - name: Upload PSP build
+      - name: Verify the install archive
+        run: |
+          unzip -t LBPPSP2008_build.zip
+          test -s dist/PSP/GAME/LBPPSP2008/EBOOT.PBP
+          test -s dist/PSP/GAME/LBPPSP2008/INTRO.PMF
+          test -s dist/PSP/GAME/LBPPSP2008/LOADING.RGBA
+          if test -e dist/PSP/GAME/LBPPSP2008/INTRO.PCM; then
+            echo "Unexpected legacy PCM sidecar."
+            exit 1
+          fi
+
+      - name: Upload PSP package, source media, PMF and ATRAC encoder
         uses: actions/upload-artifact@v4
         with:
-          name: LBPPSP-Alpha-PSP-build
+          name: LBPPSP2008-AVC-ATRAC3P
           path: |
-            psp/EBOOT.PBP
-            build/LBPPSP_ALPHA_INTRO.PMF
-            build/LBPPSP_ALPHA_INTRO.PCM
+            LBPPSP2008_build.zip
+            build/LBPPSP_ALPHA_INTRO_SOURCE.mp4
+            build/INTRO.PMF
+            build/ATRAC3P_TEST.at3
+            build/atracdenc
+            build/atracdenc.LICENSE
+            build/atracdenc-source.tar.gz
             build/LOADING.RGBA
-            LBPPSP_ALPHA_build.zip
+            build/LBPPSP2008_PIC1.png
+            LBPPSP2008_ICON0.png
+            psp/EBOOT.PBP
           if-no-files-found: error
           retention-days: 14
