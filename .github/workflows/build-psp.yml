@@ -59,7 +59,7 @@ jobs:
             -i "LBPPSP_Alpha_PIC1.png" \
             -vf "scale=480:272:flags=lanczos,format=rgba" \
             -frames:v 1 "build/LBPPSP2008_PIC1.png"
-          test "$(identify -format '%wx%h' build/LBPPSP2008_PIC1.png)" = "480x272"
+          test "$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 build/LBPPSP2008_PIC1.png)" = "480x272"
 
       - name: Validate fresh MP4 and XMB presentation assets
         run: python scripts/validate_assets.py --ffprobe ffprobe
