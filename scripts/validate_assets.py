@@ -5,7 +5,7 @@ import argparse, json, struct, subprocess, sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PNG_FILES = ("LBPPSP_Alpha_ICON0.png", "LBPPSP_Alpha_LoadingScreen.png", "LBPPSP_Alpha_PIC1.png")
+PNG_FILES = ("LBPPSP2008_ICON0.png", "LBPPSP_Alpha_LoadingScreen.png", "LBPPSP_Alpha_PIC1.png")
 AUDIO_SOURCE = "LBPPSP_Alpha_Savedata_SND0.ogg.mp3"
 
 def png_dimensions(path: Path) -> tuple[int, int]:
@@ -36,6 +36,26 @@ def main() -> int:
         try:
             w, h = png_dimensions(path)
             print(f"OK image: {name} ({w}x{h}, {path.stat().st_size} bytes)")
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+
+    icon_path = ROOT / "LBPPSP2008_ICON0.png"
+    if icon_path.is_file():
+        try:
+            if png_dimensions(icon_path) != (144, 80):
+                errors.append("LBPPSP2008_ICON0.png must be 144x80 for the PSP XMB.")
+        except (OSError, ValueError) as exc:
+            errors.append(str(exc))
+
+    xmb_background = ROOT / "build" / "LBPPSP2008_PIC1.png"
+    if not xmb_background.is_file():
+        errors.append("Missing scaled full-screen XMB background: build/LBPPSP2008_PIC1.png")
+    else:
+        try:
+            if png_dimensions(xmb_background) != (480, 272):
+                errors.append("Embedded PIC1.PNG must be exactly 480x272.")
+            else:
+                print(f"OK XMB background: 480x272 ({xmb_background.stat().st_size} bytes)")
         except (OSError, ValueError) as exc:
             errors.append(str(exc))
 
