@@ -28,7 +28,7 @@ jobs:
       - name: Install media and ATRAC3+ encoder dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg cmake build-essential libsndfile1 libsndfile1-dev
+          sudo apt-get install -y ffmpeg cmake build-essential
 
       - name: Validate repository video source
         run: |
