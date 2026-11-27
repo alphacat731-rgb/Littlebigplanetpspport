@@ -1,4 +1,4 @@
-# LittleBigPlanet PSP: Alpha
+# LBPPSP2008
 
 This repository builds a bootable PSP homebrew prototype with an automatic startup sequence and an in-game intro-video player.
 
@@ -26,9 +26,11 @@ The clean MP4 is included in the workflow artifact for inspection. It is a build
 
 ## Player implementation
 
-The AVC decoder uses the PSP's low-resolution hardware path for this 480x272 video. It queries MPEG memory with mode 4, creates a 4 MiB-aligned 2 MiB Media Engine workspace, passes that workspace to sceMpegCreate, and places the AVC access-unit buffer at workspace + 0x10000. The AU descriptor is 64-byte aligned and initialized with 0xFF sentinels, following the established PMPlayer Advance initialization pattern. The workspace is retained for the lifetime of the app instead of being returned to the heap during player teardown. The MPEG ringbuffer uses 512 sectors to reduce starvation while the decoder is assembling access units.
+The video player now follows the conventional sceMpeg path used by PSPRelay, which reports testing on a PSP-2000 running ARK-5 6.61 and in PPSSPP. It uses sceMpegQueryMemSize(0), sceMpegCreate(..., 512, 0, 0), sceMpegMallocAvcEsBuf, and sceMpegInitAu. The decoded frame is placed in eDRAM immediately after the GU draw and display buffers. sceMpegAvcDecode receives the output-buffer pointer by double indirection (&frame), matching the PSP hardware ABI used by the reference player. The previous experimental DDR-top / NULL output / custom CSC implementation has been removed. The MPEG ringbuffer uses 512 sectors.
 
-Decoded YCbCr planes are obtained with sceMpegAvcDecodeDetail2 and converted to the 8888 texture through sceMpegBaseCscAvc. The player keeps the converted texture in aligned main RAM, handles cache coherency before GU upload, and records detailed playback diagnostics. The PPSSPP-only direct-output fallback is used only if its HLE rejects the hardware-style NULL output argument. The PSMF muxer marks every GOP access-unit index entry, including each GOP's final entry, with the Sony-style 0x0080 flag and validates those flags before packaging.
+The fresh MP4 encoder uses 480x272, yuv420p, 29.97 fps, Constrained Baseline, no B-frames, a 30-frame GOP, and a bounded 768 kbit/s video bitrate. The PMF builder rejects GOP indexes over Sony's 59-access-unit limit and marks each entry with the 0x0080 flag.
+
+XMB resources are deliberately separated: ICON0.PNG is the supplied 144x80 game icon; PIC0.PNG is omitted so no information overlay can cover the background; PIC1.PNG is the supplied wallpaper scaled to exactly 480x272. The loading artwork is only converted to LOADING.RGBA and shown during the application's three-second startup splash.
 
 Technical references used to verify the playback approach:
 - PSPSDK MPEG API: https://github.com/pspdev/pspsdk/blob/master/src/mpeg/pspmpeg.h
@@ -37,11 +39,11 @@ Technical references used to verify the playback approach:
 
 ## Install on PSP or PPSSPP
 
-Download LBPPSP_ALPHA_build.zip from the successful GitHub Actions artifact. Extract it and copy its dist/PSP folder to the root of the Memory Stick.
+Download LBPPSP2008_build.zip from the successful GitHub Actions artifact. Extract it and copy its dist/PSP folder to the root of the Memory Stick.
 
 The final layout must be:
 
-    ms0:/PSP/GAME/LBPPSP_ALPHA/
+    ms0:/PSP/GAME/LBPPSP2008/
         EBOOT.PBP
         INTRO.PMF
         INTRO.PCM
@@ -61,7 +63,7 @@ The media pipeline requires FFmpeg and Python 3.12. The PSP executable requires 
 
     python scripts/prepare_intro_mp4.py
     python scripts/validate_assets.py
-    python scripts/build_intro_pmf.py --input build/LBPPSP_ALPHA_INTRO_SOURCE.mp4 --output build/LBPPSP_ALPHA_INTRO.PMF --audio-output build/LBPPSP_ALPHA_INTRO.PCM
+    python scripts/build_intro_pmf.py --input build/LBPPSP2008_INTRO_SOURCE.mp4 --output build/LBPPSP2008_INTRO.PMF --audio-output build/LBPPSP2008_INTRO.PCM
     docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make clean
     docker run --rm -v "$PWD:/workspace" -w /workspace/psp pspdev/pspdev:latest make
     python scripts/validate_pbp.py psp/EBOOT.PBP
