@@ -352,7 +352,7 @@ def make_psmf_header(stream_size: int, access_unit_count: int,
     hdr[0x68] = 2  # AVC + ATRAC3+
     hdr[0x69] = 1
     hdr[0x6A:0x6E] = u32(0x24 + extra)
-    hdr[0x6E:0x74] = start_pts.to_bytes(6, "big")
+    hdr[0x70:0x74] = u32(start_pts)
     hdr[0x74:0x76] = u16(0)
     hdr[0x76:0x7A] = u32(end_pts)
     hdr[0x7A:0x7C] = u16(1)
