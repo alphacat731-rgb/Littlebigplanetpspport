@@ -167,13 +167,15 @@ def build_atrac_test_wave(frames: list[bytes], fact_samples: int) -> bytes:
     ) + ATRAC_GUID + struct.pack("<H", 1) + ATRAC_CONFIG + bytes(8)
     if len(fmt) != 52:
         raise AssertionError("ATRAC3+ extensible fmt chunk must be 52 bytes.")
+    # RIFF/WAVE chunk sizes and the fact sample counts are little-endian.
+    le32 = lambda value: struct.pack("<I", int(value))
     body = (
         b"WAVE"
-        + b"fmt " + u32(len(fmt)) + fmt
-        + b"fact" + u32(8) + u32(fact_samples) + u32(ATRAC_FACT_OFFSET)
-        + b"data" + u32(len(raw)) + raw
+        + b"fmt " + le32(len(fmt)) + fmt
+        + b"fact" + le32(8) + le32(fact_samples) + le32(ATRAC_FACT_OFFSET)
+        + b"data" + le32(len(raw)) + raw
     )
-    return b"RIFF" + u32(len(body)) + body
+    return b"RIFF" + le32(len(body)) + body
 
 
 def audio_frame_pts(frame_index: int) -> int:
@@ -447,13 +449,15 @@ def make_at3_wave(frames: list[bytes], fact_samples: int) -> bytes:
         0xFFFE, 2, AUDIO_RATE, avg_bytes, AUDIO_CODEC_FRAME, 0, 34,
         AUDIO_SAMPLES_PER_FRAME, 3,
     ) + ATRAC_GUID + struct.pack("<H", 1) + ATRAC_CONFIG + bytes(8)
+    # RIFF/WAVE chunk sizes and the fact sample counts are little-endian.
+    le32 = lambda value: struct.pack("<I", int(value))
     body = (
         b"WAVE"
-        + b"fmt " + u32(len(fmt)) + fmt
-        + b"fact" + u32(8) + u32(fact_samples) + u32(ATRAC_FACT_OFFSET)
-        + b"data" + u32(len(raw)) + raw
+        + b"fmt " + le32(len(fmt)) + fmt
+        + b"fact" + le32(8) + le32(fact_samples) + le32(ATRAC_FACT_OFFSET)
+        + b"data" + le32(len(raw)) + raw
     )
-    return b"RIFF" + u32(len(body)) + body
+    return b"RIFF" + le32(len(body)) + body
 
 
 def main() -> None:
