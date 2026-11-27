@@ -9,6 +9,7 @@ import tempfile
 from pathlib import Path
 
 SECTOR = 2048
+MAX_GOP_INDEX_FRAMES = 59  # Sony PSMF EP-map limit used by known PSP muxers.
 FPS_PTS = 3003
 START_PTS = 90000
 SCR_DELAY = 56850
@@ -231,6 +232,11 @@ def mux_video(access_units: list[tuple[bytes, bool]], width: int, height: int) -
         if is_idr:
             gop_end = next_key[frame_index]
             sizes = [len(access_units[i][0]) for i in range(frame_index, gop_end)]
+            if len(sizes) > MAX_GOP_INDEX_FRAMES:
+                raise ValueError(
+                    f"PSMF GOP has {len(sizes)} frames; Sony index limit is "
+                    f"{MAX_GOP_INDEX_FRAMES}. Encode with a shorter GOP."
+                )
             extra = SYSTEM_HEADER + private_stream2(sizes)
 
         remaining = memoryview(access_unit)
