@@ -498,55 +498,45 @@ black_fallback:
     sceKernelDelayThread(2 * 1000 * 1000);
 }
 
-static int wait_audio(PcmOutput *audio, unsigned int pts)
-{
-    unsigned int target;
-    if (pts == 0xFFFFFFFFu || pts <= 90000u) return 0;
-    target = (unsigned int)(((unsigned long long)(pts - 90000u) * 44100u) / 90000u);
-    while (audio->running && !audio->done && audio->samples_played < target) {
-        SceCtrlData pad;
-        sceCtrlPeekBufferPositive(&pad, 1);
-        if (pad.Buttons & PSP_CTRL_CIRCLE) return -1;
-        sceKernelDelayThread(1000);
-    }
-    return 0;
-}
-
 static int play_intro(void)
 {
     int result = -1;
     int avcodec = 0, mpegbase = 0, mpeginit = 0;
-    int rb_ready = 0, mpeg_ready = 0, stream_ready = 0, gu_ready = 0;
-    int au_es_ready = 0;
+    int rb_ready = 0, mpeg_ready = 0;
+    int video_stream_ready = 0, audio_stream_ready = 0, gu_ready = 0;
+    int video_es_ready = 0, audio_es_ready = 0, audio_attempted = 0;
     SceUID file = -1;
     unsigned char header[0x800];
     SceMpeg mpeg = NULL;
     SceMpegRingbuffer ring;
-    SceMpegStream *stream = NULL;
-    SceMpegAu au_storage;
-    SceMpegAu *au = &au_storage;
+    SceMpegStream *video_stream = NULL, *audio_stream = NULL;
+    SceMpegAu video_au_storage, audio_au_storage;
+    SceMpegAu *video_au = &video_au_storage;
+    SceMpegAu *audio_au = &audio_au_storage;
     SceMpegAvcMode mode;
     PmfInput input;
-    PcmOutput audio;
-    void *rb_mem = NULL, *mpeg_mem = NULL, *au_es = NULL;
-    void *frame = NULL;
+    AtracOutput audio;
+    void *rb_mem = NULL, *mpeg_mem = NULL;
+    void *video_es = NULL, *audio_es = NULL, *frame = NULL;
     int rb_size, mpeg_size;
     SceInt32 offset = 0, stream_size = 0, unknown = 0, decode_status = 0;
+    SceInt32 atrac_es_size = 0, atrac_out_size = 0;
+    int audio_init = 1, audio_clock = 90000;
     unsigned int previous = 0;
-    int audio_started = 0, frames = 0, decode_calls = 0;
-    int au_wait_polls = 0, idle_after_eof = 0;
+    int frames = 0, video_decode_calls = 0, audio_decode_calls = 0;
+    int video_wait_polls = 0, audio_wait_polls = 0;
     unsigned long long first_frame_wait_start = 0;
     unsigned long long last_frame_time = 0;
-    char logbuf[160];
+    char logbuf[176];
 
-    last_playback_stage = "Opening INTRO.PMF";
+    last_playback_stage = "Opening multiplexed INTRO.PMF";
     last_playback_error = 0;
-    playback_log("=== PSP standard sceMpeg player begin ===");
+    playback_log("=== AVC + ATRAC3+ sceMpeg player begin ===");
     memset(&input, 0, sizeof(input));
     memset(&audio, 0, sizeof(audio));
     input.file = -1;
-    audio.file = -1;
     audio.thread = -1;
+    audio.lock = -1;
     audio.channel = -1;
 
     file = sceIoOpen(PMF_PATH, PSP_O_RDONLY, 0);
@@ -565,7 +555,11 @@ static int play_intro(void)
         set_playback_failure("Checking PSMF magic", -2);
         goto cleanup;
     }
-    playback_log("PSMF header valid");
+    if (header[0x81] != 0x02 || header[0x92] != 0xBD) {
+        set_playback_failure("Checking AVC/ATRAC3+ stream descriptors", -3);
+        goto cleanup;
+    }
+    playback_log("PSMF header advertises AVC 0xE0 and ATRAC3+ 0xBD");
 
     last_playback_stage = "Loading AVCODEC module";
     {
@@ -598,16 +592,9 @@ static int play_intro(void)
     mpeginit = 1;
     playback_log("sceMpegInit succeeded");
 
-    /*
-     * Use the ordinary PMF playback setup proven by PSPRelay on a PSP-2000
-     * and PPSSPP: sceMpeg mode 0, sceMpegMallocAvcEsBuf, and a decoded-frame
-     * buffer in eDRAM immediately after the GU draw/display buffers.
-     *
-     * The previous experimental mode-4 / DDR-top / NULL-output / CSC route
-     * was not the known-good sceMpegAvcDecode ABI and is removed here.
-     */
+    /* Standard PSPRelay setup, with conservative PSP-1000-sized buffers. */
     rb_size = sceMpegRingbufferQueryMemSize(PACKETS);
-    mpeg_size = sceMpegQueryMemSize(MPEG_MODE);
+    mpeg_size = sceMpegQueryMemSize(0);
     last_playback_stage = "Querying MPEG memory sizes";
     if (rb_size <= 0 || mpeg_size <= 0) {
         set_playback_failure("Querying MPEG memory sizes",
@@ -618,7 +605,7 @@ static int play_intro(void)
     rb_mem = memalign(64, rb_size);
     mpeg_mem = memalign(64, mpeg_size);
     if (!rb_mem || !mpeg_mem) {
-        set_playback_failure("Allocating MPEG memory", -3);
+        set_playback_failure("Allocating MPEG memory", -4);
         goto cleanup;
     }
 
@@ -636,8 +623,7 @@ static int play_intro(void)
 
     last_playback_stage = "Creating MPEG decoder";
     {
-        int ret = sceMpegCreate(&mpeg, mpeg_mem, mpeg_size, &ring,
-                                FBW, MPEG_MODE, 0);
+        int ret = sceMpegCreate(&mpeg, mpeg_mem, mpeg_size, &ring, FBW, 0, 0);
         if (ret < 0) {
             set_playback_failure("Creating MPEG decoder", ret);
             goto cleanup;
@@ -674,7 +660,7 @@ static int play_intro(void)
     }
     if (offset < (int)sizeof(header) || stream_size <= 0 ||
         (stream_size % SECTOR) != 0) {
-        set_playback_failure("Validating PMF stream bounds", -9);
+        set_playback_failure("Validating PMF stream bounds", -5);
         goto cleanup;
     }
 
@@ -687,7 +673,7 @@ static int play_intro(void)
                               (int)sizeof(scratch) : skip);
             if (n <= 0) {
                 set_playback_failure("Skipping PMF stream padding",
-                                     n < 0 ? n : -10);
+                                     n < 0 ? n : -6);
                 goto cleanup;
             }
             skip -= n;
@@ -695,54 +681,83 @@ static int play_intro(void)
     }
     input.total = (unsigned int)stream_size;
 
-    last_playback_stage = "Registering AVC stream";
-    stream = sceMpegRegistStream(&mpeg, 0, 0);
-    if (!stream) {
-        set_playback_failure("Registering AVC stream", -4);
+    last_playback_stage = "Registering AVC stream 0xE0";
+    video_stream = sceMpegRegistStream(&mpeg, 0, 0);
+    if (!video_stream) {
+        set_playback_failure("Registering AVC stream", -7);
         goto cleanup;
     }
-    stream_ready = 1;
+    video_stream_ready = 1;
 
     last_playback_stage = "Allocating AVC elementary-stream buffer";
-    au_es = sceMpegMallocAvcEsBuf(&mpeg);
-    if (!au_es) {
-        set_playback_failure("Allocating AVC elementary-stream buffer", -5);
+    video_es = sceMpegMallocAvcEsBuf(&mpeg);
+    if (!video_es) {
+        set_playback_failure("Allocating AVC elementary-stream buffer", -8);
         goto cleanup;
     }
-    au_es_ready = 1;
-    memset(au, 0xFF, sizeof(*au));
+    video_es_ready = 1;
+    memset(video_au, 0xFF, sizeof(*video_au));
     {
-        int ret = sceMpegInitAu(&mpeg, au_es, au);
+        int ret = sceMpegInitAu(&mpeg, video_es, video_au);
         if (ret < 0) {
             set_playback_failure("Initializing AVC access unit", ret);
             goto cleanup;
         }
     }
 
-    /*
-     * sceMpegAvcDecode writes directly to the PSP's eDRAM video area.
-     * Its actual ABI expects a pointer to the output-buffer pointer.
-     */
+    last_playback_stage = "Registering ATRAC3+ stream 0xBD";
+    audio_stream = sceMpegRegistStream(&mpeg, 1, 0);
+    if (!audio_stream) {
+        set_playback_failure("Registering ATRAC3+ audio stream", -9);
+        goto cleanup;
+    }
+    audio_stream_ready = 1;
+
+    last_playback_stage = "Querying ATRAC3+ decoder buffer sizes";
+    {
+        int ret = sceMpegQueryAtracEsSize(&mpeg, &atrac_es_size, &atrac_out_size);
+        if (ret < 0 || atrac_es_size <= 0 || atrac_out_size <= 0 ||
+            (atrac_out_size & 3) != 0) {
+            set_playback_failure("Querying ATRAC3+ buffer sizes",
+                                 ret < 0 ? ret : -10);
+            goto cleanup;
+        }
+    }
+    audio_es = memalign(64, atrac_es_size);
+    if (!audio_es) {
+        set_playback_failure("Allocating ATRAC3+ access-unit buffer", -11);
+        goto cleanup;
+    }
+    audio_es_ready = 1;
+    memset(audio_au, 0xFF, sizeof(*audio_au));
+    {
+        int ret = sceMpegInitAu(&mpeg, audio_es, audio_au);
+        if (ret < 0) {
+            set_playback_failure("Initializing ATRAC3+ access unit", ret);
+            goto cleanup;
+        }
+    }
+
+    last_playback_stage = "Starting ATRAC3+ hardware audio output";
+    audio_attempted = 1;
+    {
+        int ret = atrac_start(&audio, atrac_out_size);
+        if (ret < 0) {
+            set_playback_failure("Starting ATRAC3+ audio output", ret);
+            goto cleanup;
+        }
+    }
+
+    /* Use the eDRAM region after the two display buffers.  This avoids a
+       second 512x512 software framebuffer on the 32 MB PSP-1000. */
     frame = (unsigned char *)sceGeEdramGetAddr() + DRAW_BYTES + DISP_BYTES;
     if (!frame) {
-        set_playback_failure("Locating eDRAM video buffer", -6);
+        set_playback_failure("Locating eDRAM video buffer", -12);
         goto cleanup;
     }
     gu_video_init();
     gu_ready = 1;
-    playback_log("eDRAM video buffer ready; entering standard decode loop");
-
-    {
-        int pcm_result = pcm_start(&audio);
-        if (pcm_result == 0) {
-            audio_started = 1;
-            playback_log("PCM soundtrack thread started");
-        } else {
-            snprintf(logbuf, sizeof(logbuf),
-                     "WARNING: PCM audio startup failed: %d", pcm_result);
-            playback_log(logbuf);
-        }
-    }
+    playback_log("eDRAM video buffer ready; multiplexed playback loop started");
 
     first_frame_wait_start = (unsigned long long)sceKernelGetSystemTimeWide();
     last_frame_time = first_frame_wait_start;
@@ -750,7 +765,8 @@ static int play_intro(void)
     for (;;) {
         SceCtrlData pad;
         unsigned int pressed;
-        int available, got;
+        int available, video_got = -1, audio_got = -1;
+        int video_frames_this_step = 0;
 
         sceCtrlReadBufferPositive(&pad, 1);
         pressed = pad.Buttons & ~previous;
@@ -768,16 +784,14 @@ static int play_intro(void)
 
         available = sceMpegRingbufferAvailableSize(&ring);
         if (available < 0) {
-            set_playback_failure("Querying MPEG ringbuffer availability",
-                                 available);
+            set_playback_failure("Querying MPEG ringbuffer availability", available);
             goto cleanup;
         }
         if (available > 0) {
             int count = available > 32 ? 32 : available;
             int put_result = sceMpegRingbufferPut(&ring, count, available);
             if (input.read_error < 0) {
-                set_playback_failure("Reading PMF ringbuffer data",
-                                     input.read_error);
+                set_playback_failure("Reading PMF ringbuffer data", input.read_error);
                 goto cleanup;
             }
             if (put_result < 0) {
@@ -786,71 +800,118 @@ static int play_intro(void)
             }
         }
 
-        last_playback_stage = "Reading next AVC access unit";
-        got = sceMpegGetAvcAu(&mpeg, stream, au, &unknown);
-        if (got == 0) {
-            int decoded;
-            if (frames == 0)
-                playback_log("First AVC access unit acquired");
+        /* Decode ATRAC3+ into a four-buffer queue; audio output runs separately. */
+        if (atrac_pending_buffers(&audio) < AUDIO_BUFS) {
+            void *audio_buffer = atrac_reserve_buffer(&audio);
+            if (audio_buffer) {
+                last_playback_stage = "Reading ATRAC3+ access unit";
+                audio_got = sceMpegGetAtracAu(&mpeg, audio_stream, audio_au, &unknown);
+                if (audio_got == 0) {
+                    int decoded;
+                    last_playback_stage = "Decoding ATRAC3+ access unit";
+                    decoded = sceMpegAtracDecode(&mpeg, audio_au, audio_buffer, audio_init);
+                    ++audio_decode_calls;
+                    if (audio_decode_calls == 1 || (audio_decode_calls % 100) == 0) {
+                        snprintf(logbuf, sizeof(logbuf),
+                                 "ATRAC3+ decode #%d: ret=%d init=%d pts=%u",
+                                 audio_decode_calls, decoded, audio_init,
+                                 (unsigned int)audio_au->iPts);
+                        playback_log(logbuf);
+                    }
+                    if (decoded != 0) {
+                        set_playback_failure("Decoding ATRAC3+ access unit", decoded);
+                        goto cleanup;
+                    }
+                    audio_init = 0;
+                    if (audio_au->iPts == 0xFFFFFFFFu)
+                        audio_clock += 4180;
+                    else
+                        audio_clock = (int)audio_au->iPts;
+                    if (atrac_queue_buffer(&audio) < 0) {
+                        set_playback_failure("Queuing decoded ATRAC3+ audio", -13);
+                        goto cleanup;
+                    }
+                    audio_wait_polls = 0;
+                } else {
+                    ++audio_wait_polls;
+                    if (audio_wait_polls == 1 || (audio_wait_polls % 240) == 0) {
+                        snprintf(logbuf, sizeof(logbuf),
+                                 "ATRAC3+ AU pending: ret=0x%08X polls=%d input=%u/%u",
+                                 (unsigned int)audio_got, audio_wait_polls,
+                                 input.read_bytes, input.total);
+                        playback_log(logbuf);
+                    }
+                    if (audio_got == LBP_MPEG_ERROR_NOT_COMPLETED)
+                        audio_got = -1;
+                }
+            }
+        }
 
+        /* Decode video close to the latest audio timestamp, at most 3 frames. */
+        while (video_frames_this_step < 3) {
+            int decoded;
+            video_got = sceMpegGetAvcAu(&mpeg, video_stream, video_au, &unknown);
+            if (video_got != 0) {
+                ++video_wait_polls;
+                if (video_wait_polls == 1 || (video_wait_polls % 240) == 0) {
+                    snprintf(logbuf, sizeof(logbuf),
+                             "AVC AU pending: ret=0x%08X polls=%d input=%u/%u frames=%d",
+                             (unsigned int)video_got, video_wait_polls,
+                             input.read_bytes, input.total, frames);
+                    playback_log(logbuf);
+                }
+                if (video_got == LBP_MPEG_ERROR_NOT_COMPLETED)
+                    video_got = -1;
+                break;
+            }
+            video_wait_polls = 0;
             last_playback_stage = "Decoding AVC frame to eDRAM";
-            /*
-             * Do not pass NULL and do not pass a flat pixel buffer.
-             * The known-good PSP ABI takes &frame (double indirection).
-             */
-            decoded = sceMpegAvcDecode(&mpeg, au, FBW, &frame,
-                                       &decode_status);
-            ++decode_calls;
-            if (decode_calls == 1 || (decode_calls % 30) == 0) {
+            decoded = sceMpegAvcDecode(&mpeg, video_au, FBW, &frame, &decode_status);
+            ++video_decode_calls;
+            if (video_decode_calls == 1 || (video_decode_calls % 30) == 0) {
                 snprintf(logbuf, sizeof(logbuf),
-                         "AVC decode #%d: ret=%d status=%d pts=%u input=%u/%u",
-                         decode_calls, decoded, (int)decode_status,
-                         (unsigned int)au->iPts,
-                         input.read_bytes, input.total);
+                         "AVC decode #%d: ret=%d status=%d pts=%u audio_pts=%d",
+                         video_decode_calls, decoded, decode_status,
+                         (unsigned int)video_au->iPts, audio_clock);
                 playback_log(logbuf);
             }
             if (decoded != 0) {
                 set_playback_failure("Decoding AVC frame to eDRAM", decoded);
                 goto cleanup;
             }
-
             if (decode_status == 1) {
-                last_playback_stage = "Submitting decoded frame to GU";
-                if (audio_started && wait_audio(&audio, au->iPts) < 0) {
-                    result = 1;
+                if (audio_clock > 90000 &&
+                    (int)video_au->iPts > audio_clock + 3003)
                     break;
-                }
+                last_playback_stage = "Submitting decoded frame to GU";
                 gu_video_frame(frame);
                 ++frames;
+                ++video_frames_this_step;
                 last_frame_time =
                     (unsigned long long)sceKernelGetSystemTimeWide();
-                idle_after_eof = 0;
                 if (frames == 1 || (frames % 30) == 0) {
                     snprintf(logbuf, sizeof(logbuf),
-                             "GU frame submitted: frames=%d pts=%u",
-                             frames, (unsigned int)au->iPts);
+                             "GU frame submitted: frames=%d video_pts=%u audio_pts=%d",
+                             frames, (unsigned int)video_au->iPts, audio_clock);
                     playback_log(logbuf);
                 }
             }
-        } else {
-            ++au_wait_polls;
-            if (au_wait_polls == 1 || (au_wait_polls % 240) == 0) {
-                snprintf(logbuf, sizeof(logbuf),
-                         "AVC AU pending: ret=0x%08X polls=%d input=%u/%u frames=%d",
-                         (unsigned int)got, au_wait_polls,
-                         input.read_bytes, input.total, frames);
-                playback_log(logbuf);
-            }
-            sceKernelDelayThread(1000);
         }
 
-        if (input.eof && available >= PACKETS && got != 0) {
-            if (++idle_after_eof > 120) {
-                playback_log("PMF ringbuffer drained; end of video reached");
+        /* Finish only after the stream ring and queued audio have drained. */
+        {
+            int left = sceMpegRingbufferAvailableSize(&ring);
+            if (input.eof && left >= PACKETS &&
+                video_got != 0 && audio_got != 0 &&
+                atrac_pending_buffers(&audio) == 0) {
+                playback_log("PSMF ringbuffer and both media streams drained");
                 break;
             }
-        } else {
-            idle_after_eof = 0;
+        }
+
+        if (audio.error < 0) {
+            set_playback_failure("ATRAC3+ audio output thread", audio.error);
+            goto cleanup;
         }
 
         {
@@ -858,42 +919,53 @@ static int play_intro(void)
                 (unsigned long long)sceKernelGetSystemTimeWide();
             unsigned long long reference =
                 frames == 0 ? first_frame_wait_start : last_frame_time;
-            if (now - reference > 10000000ULL) {
+            if (!input.eof && now - reference > 10000000ULL) {
                 set_playback_failure(frames == 0 ?
                     "Waiting 10 seconds for first decoded frame" :
-                    "Waiting 10 seconds for the next decoded frame", -8);
+                    "Waiting 10 seconds for the next decoded frame", -14);
                 goto cleanup;
             }
         }
+
+        if (video_got != 0 && audio_got != 0)
+            sceKernelDelayThread(1000);
     }
 
     if (frames > 0 && result == -1)
         result = 0;
     if (frames == 0 && result == -1)
-        set_playback_failure("Playback ended without a decoded frame", -11);
+        set_playback_failure("Playback ended without a decoded frame", -15);
 
 cleanup:
     snprintf(logbuf, sizeof(logbuf),
-             "Playback cleanup: result=%d frames=%d decodes=%d au_wait=%d input=%u/%u",
-             result, frames, decode_calls, au_wait_polls,
-             input.read_bytes, input.total);
+             "Playback cleanup: result=%d frames=%d video_decodes=%d atrac_decodes=%d "
+             "video_wait=%d audio_wait=%d input=%u/%u audio_queue=%d",
+             result, frames, video_decode_calls, audio_decode_calls,
+             video_wait_polls, audio_wait_polls,
+             input.read_bytes, input.total,
+             audio.lock >= 0 ? atrac_pending_buffers(&audio) : 0);
     playback_log(logbuf);
-    pcm_stop(&audio);
 
+    if (audio_attempted)
+        atrac_stop(&audio);
     if (gu_ready) {
         sceGuTerm();
         pspDebugScreenInit();
     }
-    if (au_es_ready)
-        sceMpegFreeAvcEsBuf(&mpeg, au_es);
-    if (stream_ready)
-        sceMpegUnRegistStream(mpeg, stream);
+    if (video_es_ready)
+        sceMpegFreeAvcEsBuf(&mpeg, video_es);
+    if (audio_stream_ready)
+        sceMpegUnRegistStream(mpeg, audio_stream);
+    if (video_stream_ready)
+        sceMpegUnRegistStream(mpeg, video_stream);
     if (mpeg_ready)
         sceMpegDelete(&mpeg);
     if (rb_ready)
         sceMpegRingbufferDestruct(&ring);
     if (mpeginit)
         sceMpegFinish();
+    if (audio_es)
+        free(audio_es);
     if (mpegbase)
         sceUtilityUnloadAvModule(PSP_AV_MODULE_MPEGBASE);
     if (avcodec)
@@ -922,7 +994,7 @@ static void open_selected(int selected)
         else
             draw_page("VIDEO PLAYER ERROR",
                       "Could not open or decode the intro. Check that INTRO.PMF and "
-                      "INTRO.PCM are beside EBOOT.PBP in the game folder.");
+                      " are beside EBOOT.PBP in the game folder.");
     } else if (selected == 2) {
         draw_page("CREDITS", "LittleBigPlanet PSP: Alpha\nHomebrew boot and video player prototype.");
     } else {
