@@ -27,7 +27,7 @@ There is no separate PCM sidecar. The soundtrack is inside `INTRO.PMF`.
 
 Upstream ATRACDEnc defaults to 2048-byte ATRAC3+ frames, which is not the retail-rate frame size used by this PSP movie. The build therefore pins ATRACDEnc commit `cb170709f836cb43dc0312455188c791159d81dc` and applies `scripts/atracdenc-744.patch`. The patch exposes the existing encoder frame-size setting through `AT3P_FRAME`; the build sets it to 744 bytes.
 
-The build script is `scripts/build_atracdenc.sh`. ATRACDEnc is LGPL-2.1-or-later and its license is copied alongside the built encoder in the CI artifact. The patch is included in this repository for reproducibility.
+The build script is `scripts/build_atracdenc.sh`. It uses the included PCM16 WAV backend (`scripts/atracdenc_pcm_io_simple.cpp`) so local builds do not depend on libsndfile. ATRACDEnc is LGPL-2.1-or-later and its license is copied alongside the built encoder in the CI artifact. The frame-size patch and backend source are included in this repository for reproducibility.
 
 The PSMF builder is `scripts/build_intro_psmf.py`. It re-encodes the video as a PSP-oriented H.264 elementary stream, prepares 44.1 kHz stereo PCM for ATRACDEnc, creates the retail-rate ATRAC3+ frames, and multiplexes both tracks into a PSMF file. It then extracts both tracks again, checks that their payloads are byte-identical to the mux inputs, and fully decodes the recovered H.264 and ATRAC3+ tracks with FFmpeg before accepting the movie.
 
@@ -71,7 +71,7 @@ If playback fails, retrieve `PLAYBACK.LOG` from the game folder. A fallback is w
 
 ## Local build
 
-Dependencies: FFmpeg, FFprobe, Python 3.12, CMake, a C/C++ toolchain, libsndfile development headers, Docker, and the PSPSDK Docker image.
+Dependencies: FFmpeg, FFprobe, Python 3.12, CMake, a C/C++ toolchain, Docker, and the PSPSDK Docker image. The patched encoder build uses the included minimal WAV PCM16 backend, so it does not require libsndfile development headers.
 
     python scripts/prepare_intro_mp4.py
     python scripts/validate_assets.py
