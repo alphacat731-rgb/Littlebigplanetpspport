@@ -168,6 +168,7 @@ jobs:
             build/ATRAC3P_TEST.at3
             build/atracdenc
             build/atracdenc.LICENSE
+            build/atracdenc-source.tar.gz
             build/LOADING.RGBA
             build/LBPPSP2008_PIC1.png
             LBPPSP2008_ICON0.png
