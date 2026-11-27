@@ -504,7 +504,7 @@ static int play_intro(void)
     int avcodec = 0, mpegbase = 0, mpeginit = 0;
     int rb_ready = 0, mpeg_ready = 0;
     int video_stream_ready = 0, audio_stream_ready = 0, gu_ready = 0;
-    int video_es_ready = 0, audio_es_ready = 0, audio_attempted = 0;
+    int video_es_ready = 0, audio_attempted = 0;
     SceUID file = -1;
     unsigned char header[0x800];
     SceMpeg mpeg = NULL;
@@ -728,7 +728,6 @@ static int play_intro(void)
         set_playback_failure("Allocating ATRAC3+ access-unit buffer", -11);
         goto cleanup;
     }
-    audio_es_ready = 1;
     memset(audio_au, 0xFF, sizeof(*audio_au));
     {
         int ret = sceMpegInitAu(&mpeg, audio_es, audio_au);
