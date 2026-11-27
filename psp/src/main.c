@@ -237,88 +237,166 @@ static SceInt32 pmf_read_callback(ScePVoid data, SceInt32 packets, ScePVoid para
     return (SceInt32)(got / SECTOR);
 }
 
-static int pcm_thread(SceSize args, void *argp)
+static int atrac_thread(SceSize args, void *argp)
 {
-    PcmOutput *out = (PcmOutput *)argp;
+    AtracOutput *out = *(AtracOutput **)argp;
     (void)args;
-    while (out->running) {
-        int n;
+
+    while (!out->done) {
+        void *buffer = NULL;
+
         if (out->paused) {
             sceKernelDelayThread(1000);
             continue;
         }
-        n = sceIoRead(out->file, out->buffer, PCM_BYTES);
-        if (n <= 0) {
-            if (n < 0)
-                out->error = n;
-            out->done = 1;
-            break;
+
+        if (sceKernelWaitSema(out->lock, 1, NULL) < 0) {
+            sceKernelDelayThread(1000);
+            continue;
         }
-        if ((unsigned int)n < PCM_BYTES)
-            memset((unsigned char *)out->buffer + n, 0, PCM_BYTES - n);
+        if (out->count > 0)
+            buffer = out->buffers[out->head];
+        sceKernelSignalSema(out->lock, 1);
+
+        if (!buffer) {
+            sceKernelDelayThread(1000);
+            continue;
+        }
+
         {
-            int output_result = sceAudioOutputBlocking(out->channel,
-                                                       PSP_AUDIO_VOLUME_MAX,
-                                                       out->buffer);
-            if (output_result < 0) {
-                out->error = output_result;
+            int ret = sceAudioOutputBlocking(out->channel, out->volume, buffer);
+            if (ret < 0) {
+                out->error = ret;
                 out->done = 1;
                 break;
             }
         }
-        out->samples_played += (unsigned int)(n / 4);
-        if ((unsigned int)n < PCM_BYTES) {
-            out->done = 1;
-            break;
+
+        sceKernelWaitSema(out->lock, 1, NULL);
+        if (out->count > 0) {
+            out->head = (out->head + 1) % AUDIO_BUFS;
+            out->count--;
         }
+        sceKernelSignalSema(out->lock, 1);
     }
     return 0;
 }
 
-static int pcm_start(PcmOutput *out)
+static int atrac_start(AtracOutput *out, int es_output_size)
 {
+    int i;
+    AtracOutput *arg = out;
+
     memset(out, 0, sizeof(*out));
-    out->file = sceIoOpen(PCM_PATH, PSP_O_RDONLY, 0);
     out->thread = -1;
+    out->lock = -1;
     out->channel = -1;
-    if (out->file < 0) return -1;
-    out->channel = sceAudioChReserve(-1, PCM_SAMPLES, PSP_AUDIO_FORMAT_STEREO);
-    if (out->channel < 0) return -2;
-    out->buffer = memalign(64, PCM_BYTES);
-    if (!out->buffer) return -3;
-    out->running = 1;
-    out->thread = sceKernelCreateThread("LBPPSP PCM", pcm_thread, 0x18,
+    out->volume = PSP_AUDIO_VOLUME_MAX;
+    out->output_size = es_output_size;
+
+    if (es_output_size <= 0 || (es_output_size & 3) != 0)
+        return -1;
+
+    if (g_atrac_output_size != es_output_size) {
+        /* Previous buffers are intentionally retained until process exit. */
+        for (i = 0; i < AUDIO_BUFS; ++i) {
+            g_atrac_output_buffers[i] = memalign(64, es_output_size);
+            if (!g_atrac_output_buffers[i])
+                return -2;
+        }
+        g_atrac_output_size = es_output_size;
+    }
+    for (i = 0; i < AUDIO_BUFS; ++i)
+        out->buffers[i] = g_atrac_output_buffers[i];
+
+    out->channel = sceAudioChReserve(-1, 512, PSP_AUDIO_FORMAT_STEREO);
+    if (out->channel < 0)
+        return out->channel;
+
+    {
+        int ret = sceAudioSetChannelDataLen(out->channel, es_output_size / 4);
+        if (ret < 0)
+            return ret;
+    }
+
+    out->lock = sceKernelCreateSema("LBPPSP ATRAC queue", 0, 1, 1, NULL);
+    if (out->lock < 0)
+        return out->lock;
+
+    out->thread = sceKernelCreateThread("LBPPSP ATRAC", atrac_thread, 0x3E,
                                         0x4000, PSP_THREAD_ATTR_USER, NULL);
-    if (out->thread < 0) return -4;
-    if (sceKernelStartThread(out->thread, sizeof(*out), out) < 0) return -5;
+    if (out->thread < 0)
+        return out->thread;
+
+    if (sceKernelStartThread(out->thread, sizeof(arg), &arg) < 0)
+        return -3;
+
+    playback_log("ATRAC3+ output queue started (four 64-byte-aligned buffers)");
     return 0;
 }
 
-static void pcm_stop(PcmOutput *out)
+static void *atrac_reserve_buffer(AtracOutput *out)
+{
+    void *buffer = NULL;
+    if (out->lock < 0)
+        return NULL;
+    sceKernelWaitSema(out->lock, 1, NULL);
+    if (out->count < AUDIO_BUFS)
+        buffer = out->buffers[out->tail];
+    sceKernelSignalSema(out->lock, 1);
+    return buffer;
+}
+
+static int atrac_queue_buffer(AtracOutput *out)
+{
+    int ret = -1;
+    if (out->lock < 0)
+        return ret;
+    sceKernelWaitSema(out->lock, 1, NULL);
+    if (out->count < AUDIO_BUFS) {
+        out->tail = (out->tail + 1) % AUDIO_BUFS;
+        out->count++;
+        ret = 0;
+    }
+    sceKernelSignalSema(out->lock, 1);
+    return ret;
+}
+
+static int atrac_pending_buffers(AtracOutput *out)
+{
+    int count = 0;
+    if (out->lock < 0)
+        return 0;
+    sceKernelWaitSema(out->lock, 1, NULL);
+    count = out->count;
+    sceKernelSignalSema(out->lock, 1);
+    return count;
+}
+
+static void atrac_stop(AtracOutput *out)
 {
     char message[128];
-    out->running = 0;
+
+    out->done = 1;
     if (out->thread >= 0) {
+        /* sceAudioOutputBlocking may block until its current buffer finishes. */
         sceKernelTerminateDeleteThread(out->thread);
         out->thread = -1;
     }
     if (out->error < 0) {
-        snprintf(message, sizeof(message), "PCM playback failed: 0x%08X",
+        snprintf(message, sizeof(message), "ATRAC output failed: 0x%08X",
                  (unsigned int)out->error);
         playback_log(message);
+    }
+    if (out->lock >= 0) {
+        sceKernelDeleteSema(out->lock);
+        out->lock = -1;
     }
     if (out->channel >= 0) {
         sceAudioChRelease(out->channel);
         out->channel = -1;
     }
-    if (out->file >= 0) {
-        sceIoClose(out->file);
-        out->file = -1;
-    }
-    if (out->buffer) {
-        free(out->buffer);
-        out->buffer = NULL;
-    }
+    /* Global audio output buffers are intentionally retained for DMA safety. */
 }
 
 static void gu_video_init(void)
