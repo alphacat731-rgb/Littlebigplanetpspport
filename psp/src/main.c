@@ -30,9 +30,9 @@ PSP_HEAP_SIZE_KB(-2048);
 #define LBP_MPEG_ERROR_NOT_COMPLETED 0x80618001u
 #define PCM_SAMPLES 512
 #define PCM_BYTES (PCM_SAMPLES * 2 * sizeof(short))
-#define PMF_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PMF"
-#define PCM_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/INTRO.PCM"
-#define LOG_PATH "ms0:/PSP/GAME/LBPPSP_ALPHA/PLAYBACK.LOG"
+#define PMF_PATH "ms0:/PSP/GAME/LBPPSP2008/INTRO.PMF"
+#define PCM_PATH "ms0:/PSP/GAME/LBPPSP2008/INTRO.PCM"
+#define LOG_PATH "ms0:/PSP/GAME/LBPPSP2008/PLAYBACK.LOG"
 #define ROOT_LOG_PATH "ms0:/PLAYBACK.LOG"
 #define DRAW_BYTES (FBW * H * 4)
 #define DISP_BYTES (FBW * H * 4)
@@ -171,10 +171,10 @@ static void draw_menu(int selected)
     pspDebugScreenClear();
     pspDebugScreenSetXY(3, 2);
     pspDebugScreenSetTextColor(0xFFFFFFFF);
-    pspDebugScreenPrintf("LITTLEBIGPLANET PSP: ALPHA\n");
+    pspDebugScreenPrintf("LBPPSP2008\n");
     pspDebugScreenPrintf("----------------------------------------------\n\n");
     pspDebugScreenSetTextColor(0xFF9BE24A);
-    pspDebugScreenPrintf("  A small world is loading...\n\n");
+    pspDebugScreenPrintf("  LittleBigPlanet PSP 2008 prototype\n\n");
     for (i = 0; i < 4; ++i) {
         pspDebugScreenSetTextColor(i == selected ? 0xFF9BE24A : 0xFFE8E8E8);
         pspDebugScreenPrintf(i == selected ? "  > %s\n" : "    %s\n", items[i]);
@@ -189,7 +189,7 @@ static void draw_page(const char *title, const char *body)
     pspDebugScreenClear();
     pspDebugScreenSetXY(3, 2);
     pspDebugScreenSetTextColor(0xFF9BE24A);
-    pspDebugScreenPrintf("LITTLEBIGPLANET PSP: ALPHA\n");
+    pspDebugScreenPrintf("LBPPSP2008\n");
     pspDebugScreenPrintf("----------------------------------------------\n\n");
     pspDebugScreenSetTextColor(0xFFFFFFFF);
     pspDebugScreenPrintf("%s\n\n", title);
@@ -366,7 +366,7 @@ static void show_startup_splash(void)
     unsigned int loaded = 0;
     const unsigned int image_size = 512 * 512 * 4;
 
-    file = sceIoOpen("ms0:/PSP/GAME/LBPPSP_ALPHA/LOADING.RGBA", PSP_O_RDONLY, 0);
+    file = sceIoOpen("ms0:/PSP/GAME/LBPPSP2008/LOADING.RGBA", PSP_O_RDONLY, 0);
     if (file < 0)
         goto black_fallback;
 
